@@ -227,9 +227,9 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend):
     import inspect
 
     src = inspect.getsource(backend)
-    assert "+ self._tied_output_bytes(model_path)" in src, (
-        "the context budget no longer charges the tied-embedding duplicate"
-    )
+    assert (
+        "+ self._tied_output_bytes(model_path)" in src
+    ), "the context budget no longer charges the tied-embedding duplicate"
     assert "- _host_pinned," in src, "the context budget no longer discounts host-pinned embeddings"
     # Unified memory must keep charging them: there the host pool IS the budget.
     assert "_amd_apu_wants_unified_memory(gpu_ids)" in src
