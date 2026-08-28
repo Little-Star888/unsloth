@@ -7280,9 +7280,10 @@ class LlamaCppBackend:
     ) -> bool:
         """Whether ``-ot`` moves a normally host-pinned embedding off CPU.
 
-        llama.cpp applies explicit tensor buffer overrides before its CPU
-        fallback. If one matches an input embedding, keep the conservative
-        budget instead of discounting bytes that now occupy device memory.
+        llama.cpp applies arbitrary regex overrides before its CPU fallback.
+        The per-layer embedding family is open-ended, so any non-CPU mapping
+        conservatively disables the discount rather than trying to prove that
+        an arbitrary regex cannot match one of those tensors.
         """
         argv = [str(a) for a in extra_args or ()]
         values: list[str] = []
@@ -7300,21 +7301,7 @@ class LlamaCppBackend:
                 pattern, sep, buft = mapping.rpartition("=")
                 if not sep or not pattern or buft.strip().upper() == "CPU":
                     continue
-                try:
-                    moves_input = re.fullmatch(pattern, "token_embd.weight") is not None
-                    moves_per_layer = any(
-                        re.fullmatch(pattern, name) is not None
-                        for name in (
-                            "per_layer_token_embd.weight",
-                            "per_layer_token_embd.weight.0",
-                            "per_layer_token_embd.0.weight",
-                        )
-                    )
-                except re.error:
-                    # Avoid under-counting if parser dialects ever diverge.
-                    return True
-                if moves_input or moves_per_layer or "per_layer_token_embd" in pattern:
-                    return True
+                return True
         return False
 
     @staticmethod
@@ -7615,7 +7602,9 @@ class LlamaCppBackend:
             return conservative_on_unknown
         wanted = set(gpu_indices) if gpu_indices else None
         selected = [r for r in rows if wanted is None or r["index"] in wanted]
-        if wanted is not None and not selected:
+        if wanted is not None and conservative_on_unknown and {
+            r["index"] for r in selected
+        } != wanted:
             return conservative_on_unknown
         return any(r["is_igpu"] for r in selected)
 

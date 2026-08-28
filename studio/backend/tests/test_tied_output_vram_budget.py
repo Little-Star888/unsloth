@@ -267,6 +267,13 @@ def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monke
     assert backend._vulkan_targets_are_igpus("server", [0]) is True
     assert backend._vulkan_targets_are_igpus("server", [1]) is False
     assert backend._vulkan_targets_are_igpus("server", [2], conservative_on_unknown = True) is True
+    assert backend._vulkan_targets_are_igpus("server", [1, 2]) is False
+    assert (
+        backend._vulkan_targets_are_igpus(
+            "server", [1, 2], conservative_on_unknown = True
+        )
+        is True
+    )
 
     monkeypatch.setattr(backend, "_run_vulkan_probe", staticmethod(lambda _binary = None: []))
     assert backend._vulkan_targets_are_igpus("server", conservative_on_unknown = True) is True
@@ -288,6 +295,12 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
         is True
     )
     assert backend._override_moves_host_pinned(["-ot", r".*embd.*=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", "token_embd=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", "embd=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", r"per_.*47$=CUDA0"], env = {}) is True
+    # The family is open-ended, so even apparently unrelated device mappings
+    # fail closed instead of relying on incomplete regex representatives.
+    assert backend._override_moves_host_pinned(["-ot", r"^blk\.0=CUDA0"], env = {}) is True
     assert backend._override_moves_host_pinned(["-ot", r".*=CUDA0"], env = {}) is True
     assert (
         backend._override_moves_host_pinned(
@@ -301,9 +314,15 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
         )
         is True
     )
+    assert (
+        backend._override_moves_host_pinned(
+            [], env = {"LLAMA_ARG_OVERRIDE_TENSOR": "embd=CUDA0"}
+        )
+        is True
+    )
 
 
-def test_an_override_to_cpu_or_elsewhere_keeps_the_discount(backend):
+def test_cpu_only_or_absent_overrides_keep_the_discount(backend):
     # Sending them to CPU is where llama.cpp puts them anyway.
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"], env = {}) is False
     # Our own planner's patterns move FFN tensors, never the embeddings.
@@ -315,7 +334,7 @@ def test_an_override_to_cpu_or_elsewhere_keeps_the_discount(backend):
         backend._override_moves_host_pinned(
             ["-ot", "token_embd.weight=CPU,blk.0.ffn_down.weight=CUDA0"], env = {}
         )
-        is False
+        is True
     )
     assert backend._override_moves_host_pinned([], env = {}) is False
     assert backend._override_moves_host_pinned(None, env = {}) is False
