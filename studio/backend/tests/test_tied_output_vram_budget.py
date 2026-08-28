@@ -135,28 +135,22 @@ def test_the_charge_is_the_embedding_size_not_a_constant(backend, tmp_path):
 
 
 def test_a_split_gguf_is_read_across_every_shard(backend, tmp_path):
-    """A shard cannot see its siblings, so the probe must open all of them.
-
-    Reading only the named shard would call a model "tied" whenever its
-    ``output.weight`` happens to live in a later one, and would miss a per-layer
-    embedding that is not in shard 1 -- which is the Qwen3.8-Flash-Next case,
-    where that tensor is 26.82 GiB and the whole point of the correction.
-    """
+    """The probe must inspect every shard before inferring a tie or discount."""
     one = tmp_path / "m-00001-of-00002.gguf"
     two = tmp_path / "m-00002-of-00002.gguf"
     _write_gguf(one, [("token_embd.weight", (8, 64))])
     _write_gguf(two, [("output.weight", (8, 64)), ("blk.0.ffn_up.weight", (8, 8))])
-    # output.weight is in shard 2, so this model is NOT tied.
+    # output.weight in shard 2 makes this model untied.
     assert backend._tied_output_bytes(str(one)) == 0
 
-    # Same shape without an output tensor anywhere: tied, and charged.
+    # Without output.weight in any shard, the embedding is tied and charged.
     three = tmp_path / "n-00001-of-00002.gguf"
     four = tmp_path / "n-00002-of-00002.gguf"
     _write_gguf(three, [("token_embd.weight", (8, 64))])
     _write_gguf(four, [("blk.0.ffn_up.weight", (8, 8))])
     assert backend._tied_output_bytes(str(three)) == 8 * 64 * 4
 
-    # A stale same-suffix file is not part of the declared 1..N launch set.
+    # Ignore stale files outside the declared 1..N launch set.
     stale = tmp_path / "n-00003-of-00002.gguf"
     _write_gguf(stale, [("output.weight", (1, 1))])
     assert [p.name for p in backend._gguf_shard_paths(str(three))] == [three.name, four.name]
@@ -278,19 +272,8 @@ def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monke
     assert backend._vulkan_targets_are_igpus("server", conservative_on_unknown = True) is True
 
 
-# ---------------------------------------------------------------------------
-# The one thing that outranks llama.cpp's unconditional host pinning.
-# ---------------------------------------------------------------------------
-
-
 def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
-    """`-ot` is applied before the fallback, so it really can move them.
-
-    llama-model-loader.cpp:1182-1207 checks tensor_buft_overrides first. If a
-    user has sent an input embedding to CUDA0 then those bytes ARE on the card
-    and discounting them would over-commit, which is the only way this
-    correction could hurt.
-    """
+    """An explicit device override outranks llama.cpp's host fallback."""
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"], env = {}) is True
     assert (
         backend._override_moves_host_pinned(

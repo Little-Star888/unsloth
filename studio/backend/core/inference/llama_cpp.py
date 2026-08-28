@@ -7243,38 +7243,12 @@ class LlamaCppBackend:
 
     @staticmethod
     def _host_pinned_weight_bytes(model_path: str) -> int:
-        """Weight bytes llama.cpp keeps on the HOST however much VRAM there is.
+        """Bytes for embeddings llama.cpp keeps on the host.
 
-        Two tensor families never reach the device:
-
-        * ``token_embd.weight``. llama.cpp pins ``dev_input`` to the CPU
-          unconditionally (llama-model.cpp), so the input embedding is a host
-          buffer even on a card with room to spare.
-        * ``per_layer_token_embd.weight``, the gemma-3n / gemma-4 per-layer
-          embeddings and the Qwen3.8-Flash-Next n-gram embeddings. Same
-          treatment, and on those architectures it is most of the file.
-
-        Both are in the GGUF, so a budget sized from file size charges them to
-        VRAM. That is an over-count, and unlike the tied-output under-count it is
-        large enough to change which quants a machine is told it can run:
-
-            gemma-3n-E2B-it UD-Q4_K_XL        3.49 GiB file, 66.9% host-pinned
-            gemma-3n-E4B-it UD-Q4_K_XL        5.01 GiB file, 53.3% host-pinned
-            Qwen3.8-Flash-Next UD-IQ1_S      67.55 GiB file, 40.2% host-pinned
-            Qwen3.8-Flash-Next UD-Q4_K_XL   103.68 GiB file, 26.5% host-pinned
-
-        Checked against a real buffer report rather than reasoned about. On
-        gemma-4-E2B-it UD-Q4_K_XL, tensors sum to 3021.88 MiB with a 1540.00 MiB
-        per-layer embedding and a 264.00 MiB ``token_embd`` that is tied, so the
-        original sits on the host and its duplicate on the card. Predicted device
-        weights 3021.88 - 1540.00 = 1481.88 MiB; llama-server reported CUDA0 at
-        1481.89 MiB. The host floor also never fell below 1804.00 MiB across
-        forced budgets of 6, 4, 3 and 2 GiB, which is exactly the two tensors.
-
-        Returns 0 for anything unreadable, which restores the old, conservative
-        budget. Counts EVERY shard of a split model: the n-gram embedding lives
-        in one shard of several, and missing it would leave the largest case
-        uncorrected.
+        ``token_embd.weight`` and ``per_layer_token_embd`` tensors remain host
+        buffers even when the model is fully offloaded. Count every declared
+        shard; unreadable or incomplete models return 0 to preserve the previous
+        conservative budget.
         """
         try:
             paths = LlamaCppBackend._gguf_shard_paths(model_path)
@@ -7304,27 +7278,16 @@ class LlamaCppBackend:
     def _override_moves_host_pinned(
         extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
     ) -> bool:
-        """True when a user ``-ot`` sends an input embedding somewhere not CPU.
+        """Whether ``-ot`` moves a normally host-pinned embedding off CPU.
 
-        The host pinning this budget relies on is unconditional in llama.cpp
-        (llama-model.cpp:1481-1483, "always keep it on the CPU"), and the
-        type-gated ``GET_ROWS`` support list is only ever consulted WITHIN the
-        list it was handed, which for these tensors is CPU-only.
-
-        The one thing that outranks it is an explicit override:
-        llama-model-loader.cpp:1182-1207 applies ``tensor_buft_overrides``
-        BEFORE the fallback, so a user pattern naming token_embd with a GPU
-        buffer type really does move it. Our own planner never emits one, but
-        extra_args belongs to the user. Discounting bytes that a flag has just
-        put on the card would be the one way this correction could over-commit,
-        so detect it and keep the conservative number.
+        llama.cpp applies explicit tensor buffer overrides before its CPU
+        fallback. If one matches an input embedding, keep the conservative
+        budget instead of discounting bytes that now occupy device memory.
         """
         argv = [str(a) for a in extra_args or ()]
         values: list[str] = []
         for i, tok in enumerate(argv):
-            # llama.cpp folds underscores in option names before matching. Attached
-            # values are deliberately excluded: the child accepts this option only
-            # as a separate flag/value pair.
+            # llama.cpp folds underscores in option names and expects a separate value.
             if "=" not in tok and _flag_name(tok) in ("-ot", "--override-tensor"):
                 if i + 1 < len(argv):
                     values.append(argv[i + 1])
@@ -7333,8 +7296,7 @@ class LlamaCppBackend:
             values.append(str(inherited))
         for spec in values:
             for mapping in spec.split(","):
-                # `pattern=buft`, and llama.cpp splits each repeatable entry on
-                # the LAST '='.
+                # llama.cpp splits each `pattern=buft` entry on the last '='.
                 pattern, sep, buft = mapping.rpartition("=")
                 if not sep or not pattern or buft.strip().upper() == "CPU":
                     continue
@@ -7349,8 +7311,7 @@ class LlamaCppBackend:
                         )
                     )
                 except re.error:
-                    # The child will reject an invalid regex. Keep the conservative
-                    # budget rather than letting parser-dialect drift under-count.
+                    # Avoid under-counting if parser dialects ever diverge.
                     return True
                 if moves_input or moves_per_layer or "per_layer_token_embd" in pattern:
                     return True
@@ -7371,19 +7332,13 @@ class LlamaCppBackend:
 
     @staticmethod
     def _gguf_shard_paths(model_path: str) -> "list[Path]":
-        """``model_path`` plus its sibling shards, in name order.
-
-        Uses the same exact 1..N identity as the launched process. The tensor
-        probes must not let an unrelated stale sibling change their answer.
-        """
+        """Return the launched model's exact 1..N shard set in name order."""
         main = Path(model_path)
         m = _SHARD_FULL_RE.match(main.name)
         if not m:
             return [main]
         prefix, _, num_total = m.groups()
-        # Match the exact source identity used by the launched process: indices
-        # 1..N only. Missing shards then fail the caller's stat pass and restore
-        # the conservative zero correction.
+        # Missing declared shards fail the caller's stat pass conservatively.
         return [
             main.with_name(f"{prefix}-{index:05d}-of-{num_total}{main.suffix}")
             for index in range(1, int(num_total) + 1)
@@ -7416,10 +7371,7 @@ class LlamaCppBackend:
         GGUF costs the old, slightly optimistic budget instead of a failed
         launch.
         """
-        # Every shard, not just the one named. A GGUFReader maps only the path it
-        # is given, so on a split model an ``output.weight`` living in shard 3
-        # would read as "tied" from shard 1 and add a duplicate that is never
-        # allocated. Reading them all answers instead of abstaining.
+        # GGUFReader maps one path, so inspect every shard before inferring a tie.
         try:
             paths = LlamaCppBackend._gguf_shard_paths(model_path)
             stats = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
@@ -18018,22 +17970,9 @@ class LlamaCppBackend:
                     # card cannot hold. 264 MiB on gemma-4-E2B UD-Q4_K_XL and
                     # 924 MiB on gemma-4-31B UD-Q4_K_XL, against files of 3037
                     # and 17951 MiB.
-                    # What actually lands in VRAM, not what the file weighs.
-                    #
-                    # Up: a tied-embedding model allocates one more copy of the
-                    # embedding matrix than its file contains, because llama.cpp
-                    # re-creates output.weight from token_embd as
-                    # TENSOR_DUPLICATED.
-                    #
-                    # Down: token_embd itself never reaches the device
-                    # (llama.cpp pins dev_input to the CPU), and neither do the
-                    # per-layer / n-gram embeddings. On gemma-3n and
-                    # Qwen3.8-Flash-Next that is 26% to 67% of the file, so
-                    # charging it is what makes a runnable quant read as too big.
-                    #
-                    # Unified memory is excluded: there the "VRAM" IS host RAM,
-                    # so a host-pinned tensor occupies the same pool this budget
-                    # is spending and discounting it would double-count the room.
+                    # Charge the tied output duplicate, but discount embeddings
+                    # llama.cpp keeps on the host. Shared-memory devices still
+                    # spend the same pool, so they receive no discount.
                     from utils.hardware import is_apple_silicon
 
                     _shared_memory = (
