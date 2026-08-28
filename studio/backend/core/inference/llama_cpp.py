@@ -7301,7 +7301,9 @@ class LlamaCppBackend:
             return 0
 
     @staticmethod
-    def _override_moves_host_pinned(extra_args: Optional[Iterable[str]]) -> bool:
+    def _override_moves_host_pinned(
+        extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
+    ) -> bool:
         """True when a user ``-ot`` sends an input embedding somewhere not CPU.
 
         The host pinning this budget relies on is unconditional in llama.cpp
@@ -7317,45 +7319,75 @@ class LlamaCppBackend:
         put on the card would be the one way this correction could over-commit,
         so detect it and keep the conservative number.
         """
-        if not extra_args:
-            return False
-        argv = [str(a) for a in extra_args]
+        argv = [str(a) for a in extra_args or ()]
         values: list[str] = []
         for i, tok in enumerate(argv):
-            if tok in ("-ot", "--override-tensor"):
+            # llama.cpp folds underscores in option names before matching. Attached
+            # values are deliberately excluded: the child accepts this option only
+            # as a separate flag/value pair.
+            if "=" not in tok and _flag_name(tok) in ("-ot", "--override-tensor"):
                 if i + 1 < len(argv):
                     values.append(argv[i + 1])
-            elif tok.startswith("--override-tensor="):
-                values.append(tok.split("=", 1)[1])
+        inherited = (os.environ if env is None else env).get("LLAMA_ARG_OVERRIDE_TENSOR")
+        if inherited:
+            values.append(str(inherited))
         for spec in values:
-            # `pattern=buft`, and llama.cpp splits on the LAST '='.
-            pattern, _, buft = spec.rpartition("=")
-            if not pattern or buft.upper() == "CPU":
-                continue
-            if "token_embd" in pattern or "per_layer_token_embd" in pattern:
-                return True
+            for mapping in spec.split(","):
+                # `pattern=buft`, and llama.cpp splits each repeatable entry on
+                # the LAST '='.
+                pattern, sep, buft = mapping.rpartition("=")
+                if not sep or not pattern or buft.strip().upper() == "CPU":
+                    continue
+                try:
+                    moves_input = re.fullmatch(pattern, "token_embd.weight") is not None
+                    moves_per_layer = any(
+                        re.fullmatch(pattern, name) is not None
+                        for name in (
+                            "per_layer_token_embd.weight",
+                            "per_layer_token_embd.weight.0",
+                            "per_layer_token_embd.0.weight",
+                        )
+                    )
+                except re.error:
+                    # The child will reject an invalid regex. Keep the conservative
+                    # budget rather than letting parser-dialect drift under-count.
+                    return True
+                if moves_input or moves_per_layer or "per_layer_token_embd" in pattern:
+                    return True
         return False
+
+    @staticmethod
+    def _host_pinned_vram_discount(
+        model_path: str,
+        extra_args: Optional[Iterable[str]],
+        *,
+        env: Optional[Mapping[str, str]] = None,
+        shared_memory: bool = False,
+    ) -> int:
+        """Bytes safe to remove from a discrete-device VRAM budget."""
+        if shared_memory or LlamaCppBackend._override_moves_host_pinned(extra_args, env):
+            return 0
+        return LlamaCppBackend._host_pinned_weight_bytes(model_path)
 
     @staticmethod
     def _gguf_shard_paths(model_path: str) -> "list[Path]":
         """``model_path`` plus its sibling shards, in name order.
 
-        Mirrors the enumeration in ``_get_gguf_size_bytes``; kept separate so the
-        tensor probes see the same set of files the size does.
+        Uses the same exact 1..N identity as the launched process. The tensor
+        probes must not let an unrelated stale sibling change their answer.
         """
         main = Path(model_path)
-        out = [main]
         m = _SHARD_FULL_RE.match(main.name)
-        if m:
-            prefix, _, num_total = m.group(1), m.group(2), m.group(3)
-            sibling_pat = re.compile(
-                r"^" + re.escape(prefix) + r"-\d{5}-of-" + re.escape(num_total) + r"\.gguf$",
-                re.IGNORECASE,
-            )
-            for sibling in main.parent.iterdir():
-                if sibling != main and sibling_pat.match(sibling.name):
-                    out.append(sibling)
-        return sorted(out, key = lambda p: p.name)
+        if not m:
+            return [main]
+        prefix, _, num_total = m.groups()
+        # Match the exact source identity used by the launched process: indices
+        # 1..N only. Missing shards then fail the caller's stat pass and restore
+        # the conservative zero correction.
+        return [
+            main.with_name(f"{prefix}-{index:05d}-of-{num_total}{main.suffix}")
+            for index in range(1, int(num_total) + 1)
+        ]
 
     @staticmethod
     def _tied_output_bytes(model_path: str) -> int:
@@ -7608,7 +7640,12 @@ class LlamaCppBackend:
         )
 
     @staticmethod
-    def _vulkan_targets_are_igpus(binary: Optional[str], gpu_indices = None) -> bool:
+    def _vulkan_targets_are_igpus(
+        binary: Optional[str],
+        gpu_indices = None,
+        *,
+        conservative_on_unknown: bool = False,
+    ) -> bool:
         """True when any Vulkan device in play is integrated.
 
         An iGPU's reported "VRAM" is shared system RAM (see
@@ -7621,11 +7658,13 @@ class LlamaCppBackend:
         try:
             rows = LlamaCppBackend._run_vulkan_probe(binary)
         except Exception:
-            return False
+            return conservative_on_unknown
         if not rows:
-            return False
+            return conservative_on_unknown
         wanted = set(gpu_indices) if gpu_indices else None
         selected = [r for r in rows if wanted is None or r["index"] in wanted]
+        if wanted is not None and not selected:
+            return conservative_on_unknown
         return any(r["is_igpu"] for r in selected)
 
     def _weights_in_host_memory(
@@ -17997,15 +18036,24 @@ class LlamaCppBackend:
                     # is spending and discounting it would double-count the room.
                     from utils.hardware import is_apple_silicon
 
-                    _host_pinned = (
-                        0
-                        if (
-                            is_apple_silicon()
-                            or self._amd_apu_wants_unified_memory(gpu_ids)
-                            or self._integrated_cuda_unified_memory(gpu_ids)
-                            or self._override_moves_host_pinned(extra_args)
+                    _shared_memory = (
+                        is_apple_silicon()
+                        or self._amd_apu_wants_unified_memory(gpu_ids)
+                        or self._integrated_cuda_unified_memory(gpu_ids)
+                        or (
+                            is_vulkan_backend
+                            and self._vulkan_targets_are_igpus(
+                                binary,
+                                gpu_ids,
+                                conservative_on_unknown = True,
+                            )
                         )
-                        else self._host_pinned_weight_bytes(model_path)
+                    )
+                    _host_pinned = self._host_pinned_vram_discount(
+                        model_path,
+                        extra_args,
+                        env = os.environ,
+                        shared_memory = _shared_memory,
                     )
                     model_size = max(
                         0,

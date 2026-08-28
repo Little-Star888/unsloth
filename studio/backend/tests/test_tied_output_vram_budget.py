@@ -156,6 +156,18 @@ def test_a_split_gguf_is_read_across_every_shard(backend, tmp_path):
     _write_gguf(four, [("blk.0.ffn_up.weight", (8, 8))])
     assert backend._tied_output_bytes(str(three)) == 8 * 64 * 4
 
+    # A stale same-suffix file is not part of the declared 1..N launch set.
+    stale = tmp_path / "n-00003-of-00002.gguf"
+    _write_gguf(stale, [("output.weight", (1, 1))])
+    assert [p.name for p in backend._gguf_shard_paths(str(three))] == [three.name, four.name]
+    assert backend._tied_output_bytes(str(three)) == 8 * 64 * 4
+
+    # A partial split cannot answer either correction safely.
+    partial = tmp_path / "q-00001-of-00002.gguf"
+    _write_gguf(partial, [("token_embd.weight", (8, 64))])
+    assert backend._tied_output_bytes(str(partial)) == 0
+    assert backend._host_pinned_weight_bytes(str(partial)) == 0
+
 
 def test_the_per_layer_embedding_is_counted_from_a_later_shard(backend, tmp_path):
     """The largest host-pinned tensor is not required to be in shard 1."""
@@ -217,23 +229,53 @@ def test_the_probe_is_cached_on_file_identity_not_path(backend, tmp_path):
     assert backend._tied_output_bytes(str(path)) == 8 * 128 * 4
 
 
-def test_the_budget_sizes_from_what_lands_in_vram(backend):
-    """The call site adds the duplicate and subtracts the host-pinned bytes.
-
-    Reads the source rather than driving a full load, which needs a GPU and a
-    binary. What must hold is that `model_size` is neither the bare file size nor
-    only half the correction.
-    """
+def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
+    """The pure budget seam keeps discrete and shared-memory arithmetic distinct."""
     import inspect
 
-    src = inspect.getsource(backend)
+    expected = 8 * 64 * 4
     assert (
-        "+ self._tied_output_bytes(model_path)" in src
-    ), "the context budget no longer charges the tied-embedding duplicate"
+        backend._host_pinned_vram_discount(str(tied_gguf), [], env = {}, shared_memory = False)
+        == expected
+    )
+    assert backend._host_pinned_vram_discount(str(tied_gguf), [], env = {}, shared_memory = True) == 0
+    assert (
+        backend._host_pinned_vram_discount(
+            str(tied_gguf),
+            [],
+            env = {"LLAMA_ARG_OVERRIDE_TENSOR": "token_embd.weight=CUDA0"},
+            shared_memory = False,
+        )
+        == 0
+    )
+
+    src = inspect.getsource(backend)
+    assert "+ self._tied_output_bytes(model_path)" in src, (
+        "the context budget no longer charges the tied-embedding duplicate"
+    )
     assert "- _host_pinned," in src, "the context budget no longer discounts host-pinned embeddings"
-    # Unified memory must keep charging them: there the host pool IS the budget.
-    assert "_amd_apu_wants_unified_memory(gpu_ids)" in src
-    assert "_integrated_cuda_unified_memory(gpu_ids)" in src
+    assert "_host_pinned_vram_discount(" in src
+    assert "env = os.environ" in src
+    assert "shared_memory = _shared_memory" in src
+
+
+def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monkeypatch):
+    monkeypatch.setattr(
+        backend,
+        "_run_vulkan_probe",
+        staticmethod(
+            lambda _binary = None: [
+                {"index": 0, "is_igpu": True},
+                {"index": 1, "is_igpu": False},
+            ]
+        ),
+    )
+    assert backend._vulkan_targets_are_igpus("server", [0]) is True
+    assert backend._vulkan_targets_are_igpus("server", [1]) is False
+    assert backend._vulkan_targets_are_igpus("server", [2], conservative_on_unknown = True) is True
+
+    monkeypatch.setattr(backend, "_run_vulkan_probe", staticmethod(lambda _binary = None: []))
+    assert backend._vulkan_targets_are_igpus("server", conservative_on_unknown = True) is True
 
 
 # ---------------------------------------------------------------------------
@@ -249,24 +291,50 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
     and discounting them would over-commit, which is the only way this
     correction could hurt.
     """
-    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"]) is True
+    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"], env = {}) is True
     assert (
-        backend._override_moves_host_pinned(["-ot", r"^per_layer_token_embd\.weight$=CUDA0"])
+        backend._override_moves_host_pinned(
+            ["-ot", r"^per_layer_token_embd\.weight$=CUDA0"], env = {}
+        )
         is True
     )
     assert (
-        backend._override_moves_host_pinned(["--override-tensor=token_embd.weight=CUDA0"]) is True
+        backend._override_moves_host_pinned(
+            ["--override_tensor", "token_embd.weight=CUDA0"], env = {}
+        )
+        is True
+    )
+    assert backend._override_moves_host_pinned(["-ot", r".*embd.*=CUDA0"], env = {}) is True
+    assert backend._override_moves_host_pinned(["-ot", r".*=CUDA0"], env = {}) is True
+    assert (
+        backend._override_moves_host_pinned(
+            ["-ot", "token_embd.weight=CUDA0,blk.0.ffn_down.weight=CPU"], env = {}
+        )
+        is True
+    )
+    assert (
+        backend._override_moves_host_pinned(
+            [], env = {"LLAMA_ARG_OVERRIDE_TENSOR": "token_embd.weight=CUDA0"}
+        )
+        is True
     )
 
 
 def test_an_override_to_cpu_or_elsewhere_keeps_the_discount(backend):
     # Sending them to CPU is where llama.cpp puts them anyway.
-    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"]) is False
+    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"], env = {}) is False
     # Our own planner's patterns move FFN tensors, never the embeddings.
     assert (
-        backend._override_moves_host_pinned(["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"]) is False
+        backend._override_moves_host_pinned(["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"], env = {})
+        is False
     )
-    assert backend._override_moves_host_pinned([]) is False
-    assert backend._override_moves_host_pinned(None) is False
+    assert (
+        backend._override_moves_host_pinned(
+            ["-ot", "token_embd.weight=CPU,blk.0.ffn_down.weight=CUDA0"], env = {}
+        )
+        is False
+    )
+    assert backend._override_moves_host_pinned([], env = {}) is False
+    assert backend._override_moves_host_pinned(None, env = {}) is False
     # A bare flag with no value must not crash the budget.
-    assert backend._override_moves_host_pinned(["-ot"]) is False
+    assert backend._override_moves_host_pinned(["-ot"], env = {}) is False
