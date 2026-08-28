@@ -78,29 +78,34 @@ def _write_gguf(path: Path, tensors: "list[tuple[str, tuple[int, ...]]]") -> Non
 def backend():
     pytest.importorskip("gguf")
     from core.inference.llama_cpp import LlamaCppBackend
-
     return LlamaCppBackend
 
 
 @pytest.fixture
 def tied_gguf(tmp_path: Path) -> Path:
     path = tmp_path / "tied.gguf"
-    _write_gguf(path, [
-        ("token_embd.weight", (8, 64)),          # 2048 bytes at f32
-        ("blk.0.attn_q.weight", (8, 8)),
-        ("blk.0.ffn_down.weight", (8, 8)),
-    ])
+    _write_gguf(
+        path,
+        [
+            ("token_embd.weight", (8, 64)),  # 2048 bytes at f32
+            ("blk.0.attn_q.weight", (8, 8)),
+            ("blk.0.ffn_down.weight", (8, 8)),
+        ],
+    )
     return path
 
 
 @pytest.fixture
 def untied_gguf(tmp_path: Path) -> Path:
     path = tmp_path / "untied.gguf"
-    _write_gguf(path, [
-        ("token_embd.weight", (8, 64)),
-        ("output.weight", (8, 64)),
-        ("blk.0.attn_q.weight", (8, 8)),
-    ])
+    _write_gguf(
+        path,
+        [
+            ("token_embd.weight", (8, 64)),
+            ("output.weight", (8, 64)),
+            ("blk.0.attn_q.weight", (8, 8)),
+        ],
+    )
     return path
 
 
@@ -166,11 +171,14 @@ def test_host_pinned_covers_both_embedding_families(backend, tied_gguf, tmp_path
     assert backend._host_pinned_weight_bytes(str(tied_gguf)) == 8 * 64 * 4
 
     ple = tmp_path / "ple.gguf"
-    _write_gguf(ple, [
-        ("token_embd.weight", (8, 64)),
-        ("per_layer_token_embd.weight", (32, 64)),
-        ("blk.0.ffn_up.weight", (8, 8)),
-    ])
+    _write_gguf(
+        ple,
+        [
+            ("token_embd.weight", (8, 64)),
+            ("per_layer_token_embd.weight", (32, 64)),
+            ("blk.0.ffn_up.weight", (8, 8)),
+        ],
+    )
     assert backend._host_pinned_weight_bytes(str(ple)) == (8 * 64 * 4) + (32 * 64 * 4)
 
 
@@ -222,9 +230,7 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend):
     assert "+ self._tied_output_bytes(model_path)" in src, (
         "the context budget no longer charges the tied-embedding duplicate"
     )
-    assert "- _host_pinned," in src, (
-        "the context budget no longer discounts host-pinned embeddings"
-    )
+    assert "- _host_pinned," in src, "the context budget no longer discounts host-pinned embeddings"
     # Unified memory must keep charging them: there the host pool IS the budget.
     assert "_amd_apu_wants_unified_memory(gpu_ids)" in src
     assert "_integrated_cuda_unified_memory(gpu_ids)" in src
@@ -233,6 +239,7 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend):
 # ---------------------------------------------------------------------------
 # The one thing that outranks llama.cpp's unconditional host pinning.
 # ---------------------------------------------------------------------------
+
 
 def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
     """`-ot` is applied before the fallback, so it really can move them.
@@ -243,17 +250,22 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
     correction could hurt.
     """
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"]) is True
-    assert backend._override_moves_host_pinned(
-        ["-ot", r"^per_layer_token_embd\.weight$=CUDA0"]) is True
-    assert backend._override_moves_host_pinned(["--override-tensor=token_embd.weight=CUDA0"]) is True
+    assert (
+        backend._override_moves_host_pinned(["-ot", r"^per_layer_token_embd\.weight$=CUDA0"])
+        is True
+    )
+    assert (
+        backend._override_moves_host_pinned(["--override-tensor=token_embd.weight=CUDA0"]) is True
+    )
 
 
 def test_an_override_to_cpu_or_elsewhere_keeps_the_discount(backend):
     # Sending them to CPU is where llama.cpp puts them anyway.
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"]) is False
     # Our own planner's patterns move FFN tensors, never the embeddings.
-    assert backend._override_moves_host_pinned(
-        ["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"]) is False
+    assert (
+        backend._override_moves_host_pinned(["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"]) is False
+    )
     assert backend._override_moves_host_pinned([]) is False
     assert backend._override_moves_host_pinned(None) is False
     # A bare flag with no value must not crash the budget.

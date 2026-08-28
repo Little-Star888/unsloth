@@ -17997,15 +17997,20 @@ class LlamaCppBackend:
                     # is spending and discounting it would double-count the room.
                     from utils.hardware import is_apple_silicon
 
-                    _host_pinned = 0 if (
-                        is_apple_silicon()
-                        or self._amd_apu_wants_unified_memory(gpu_ids)
-                        or self._integrated_cuda_unified_memory(gpu_ids)
-                        or self._override_moves_host_pinned(extra_args)
-                    ) else self._host_pinned_weight_bytes(model_path)
+                    _host_pinned = (
+                        0
+                        if (
+                            is_apple_silicon()
+                            or self._amd_apu_wants_unified_memory(gpu_ids)
+                            or self._integrated_cuda_unified_memory(gpu_ids)
+                            or self._override_moves_host_pinned(extra_args)
+                        )
+                        else self._host_pinned_weight_bytes(model_path)
+                    )
                     model_size = max(
                         0,
-                        gguf_size + mmproj_size
+                        gguf_size
+                        + mmproj_size
                         + self._tied_output_bytes(model_path)
                         - _host_pinned,
                     )
