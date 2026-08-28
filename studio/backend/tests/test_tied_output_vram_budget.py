@@ -129,18 +129,56 @@ def test_the_charge_is_the_embedding_size_not_a_constant(backend, tmp_path):
     assert backend._tied_output_bytes(str(large)) == 4 * backend._tied_output_bytes(str(small))
 
 
-def test_a_split_gguf_abstains(backend, tmp_path):
-    """A shard cannot see its siblings, so absence of output.weight proves nothing.
+def test_a_split_gguf_is_read_across_every_shard(backend, tmp_path):
+    """A shard cannot see its siblings, so the probe must open all of them.
 
-    GGUFReader maps only the path it is given. On a split model ``output.weight``
-    may live in a later shard, which would read as "tied" here and add a
-    duplicate that is never allocated -- an over-count, on exactly the models
-    large enough to be split. Abstaining costs the old behaviour; guessing costs
-    a wrongly shrunken context.
+    Reading only the named shard would call a model "tied" whenever its
+    ``output.weight`` happens to live in a later one, and would miss a per-layer
+    embedding that is not in shard 1 -- which is the Qwen3.8-Flash-Next case,
+    where that tensor is 26.82 GiB and the whole point of the correction.
     """
-    path = tmp_path / "model-00001-of-00003.gguf"
-    _write_gguf(path, [("token_embd.weight", (8, 64))])
-    assert backend._tied_output_bytes(str(path)) == 0
+    one = tmp_path / "m-00001-of-00002.gguf"
+    two = tmp_path / "m-00002-of-00002.gguf"
+    _write_gguf(one, [("token_embd.weight", (8, 64))])
+    _write_gguf(two, [("output.weight", (8, 64)), ("blk.0.ffn_up.weight", (8, 8))])
+    # output.weight is in shard 2, so this model is NOT tied.
+    assert backend._tied_output_bytes(str(one)) == 0
+
+    # Same shape without an output tensor anywhere: tied, and charged.
+    three = tmp_path / "n-00001-of-00002.gguf"
+    four = tmp_path / "n-00002-of-00002.gguf"
+    _write_gguf(three, [("token_embd.weight", (8, 64))])
+    _write_gguf(four, [("blk.0.ffn_up.weight", (8, 8))])
+    assert backend._tied_output_bytes(str(three)) == 8 * 64 * 4
+
+
+def test_the_per_layer_embedding_is_counted_from_a_later_shard(backend, tmp_path):
+    """The largest host-pinned tensor is not required to be in shard 1."""
+    one = tmp_path / "p-00001-of-00002.gguf"
+    two = tmp_path / "p-00002-of-00002.gguf"
+    _write_gguf(one, [("token_embd.weight", (8, 64))])
+    _write_gguf(two, [("per_layer_token_embd.weight", (16, 64)), ("output.weight", (8, 64))])
+    assert backend._host_pinned_weight_bytes(str(one)) == (8 * 64 * 4) + (16 * 64 * 4)
+
+
+def test_host_pinned_covers_both_embedding_families(backend, tied_gguf, tmp_path):
+    # token_embd alone on a model without per-layer embeddings.
+    assert backend._host_pinned_weight_bytes(str(tied_gguf)) == 8 * 64 * 4
+
+    ple = tmp_path / "ple.gguf"
+    _write_gguf(ple, [
+        ("token_embd.weight", (8, 64)),
+        ("per_layer_token_embd.weight", (32, 64)),
+        ("blk.0.ffn_up.weight", (8, 8)),
+    ])
+    assert backend._host_pinned_weight_bytes(str(ple)) == (8 * 64 * 4) + (32 * 64 * 4)
+
+
+def test_host_pinned_is_zero_for_an_unreadable_file(backend, tmp_path):
+    junk = tmp_path / "junk2.gguf"
+    junk.write_bytes(b"nope")
+    assert backend._host_pinned_weight_bytes(str(junk)) == 0
+    assert backend._host_pinned_weight_bytes(str(tmp_path / "gone.gguf")) == 0
 
 
 def test_an_unreadable_file_costs_the_old_budget_rather_than_the_launch(backend, tmp_path):
@@ -171,16 +209,52 @@ def test_the_probe_is_cached_on_file_identity_not_path(backend, tmp_path):
     assert backend._tied_output_bytes(str(path)) == 8 * 128 * 4
 
 
-def test_the_budget_adds_the_duplicate_to_the_gguf_size(backend, tied_gguf):
-    """The call site adds it; the helper alone proves nothing.
+def test_the_budget_sizes_from_what_lands_in_vram(backend):
+    """The call site adds the duplicate and subtracts the host-pinned bytes.
 
-    Reads the source of the context-budget block rather than driving a full
-    load, which needs a GPU and a binary. What must hold is that `model_size`
-    is not the bare file size any more.
+    Reads the source rather than driving a full load, which needs a GPU and a
+    binary. What must hold is that `model_size` is neither the bare file size nor
+    only half the correction.
     """
     import inspect
 
     src = inspect.getsource(backend)
-    assert "model_size = gguf_size + mmproj_size + self._tied_output_bytes(model_path)" in src, (
+    assert "+ self._tied_output_bytes(model_path)" in src, (
         "the context budget no longer charges the tied-embedding duplicate"
     )
+    assert "- _host_pinned," in src, (
+        "the context budget no longer discounts host-pinned embeddings"
+    )
+    # Unified memory must keep charging them: there the host pool IS the budget.
+    assert "_amd_apu_wants_unified_memory(gpu_ids)" in src
+    assert "_integrated_cuda_unified_memory(gpu_ids)" in src
+
+
+# ---------------------------------------------------------------------------
+# The one thing that outranks llama.cpp's unconditional host pinning.
+# ---------------------------------------------------------------------------
+
+def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
+    """`-ot` is applied before the fallback, so it really can move them.
+
+    llama-model-loader.cpp:1182-1207 checks tensor_buft_overrides first. If a
+    user has sent an input embedding to CUDA0 then those bytes ARE on the card
+    and discounting them would over-commit, which is the only way this
+    correction could hurt.
+    """
+    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"]) is True
+    assert backend._override_moves_host_pinned(
+        ["-ot", r"^per_layer_token_embd\.weight$=CUDA0"]) is True
+    assert backend._override_moves_host_pinned(["--override-tensor=token_embd.weight=CUDA0"]) is True
+
+
+def test_an_override_to_cpu_or_elsewhere_keeps_the_discount(backend):
+    # Sending them to CPU is where llama.cpp puts them anyway.
+    assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"]) is False
+    # Our own planner's patterns move FFN tensors, never the embeddings.
+    assert backend._override_moves_host_pinned(
+        ["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"]) is False
+    assert backend._override_moves_host_pinned([]) is False
+    assert backend._override_moves_host_pinned(None) is False
+    # A bare flag with no value must not crash the budget.
+    assert backend._override_moves_host_pinned(["-ot"]) is False

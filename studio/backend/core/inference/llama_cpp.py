@@ -7242,6 +7242,122 @@ class LlamaCppBackend:
         return total
 
     @staticmethod
+    def _host_pinned_weight_bytes(model_path: str) -> int:
+        """Weight bytes llama.cpp keeps on the HOST however much VRAM there is.
+
+        Two tensor families never reach the device:
+
+        * ``token_embd.weight``. llama.cpp pins ``dev_input`` to the CPU
+          unconditionally (llama-model.cpp), so the input embedding is a host
+          buffer even on a card with room to spare.
+        * ``per_layer_token_embd.weight``, the gemma-3n / gemma-4 per-layer
+          embeddings and the Qwen3.8-Flash-Next n-gram embeddings. Same
+          treatment, and on those architectures it is most of the file.
+
+        Both are in the GGUF, so a budget sized from file size charges them to
+        VRAM. That is an over-count, and unlike the tied-output under-count it is
+        large enough to change which quants a machine is told it can run:
+
+            gemma-3n-E2B-it UD-Q4_K_XL        3.49 GiB file, 66.9% host-pinned
+            gemma-3n-E4B-it UD-Q4_K_XL        5.01 GiB file, 53.3% host-pinned
+            Qwen3.8-Flash-Next UD-IQ1_S      67.55 GiB file, 40.2% host-pinned
+            Qwen3.8-Flash-Next UD-Q4_K_XL   103.68 GiB file, 26.5% host-pinned
+
+        Checked against a real buffer report rather than reasoned about. On
+        gemma-4-E2B-it UD-Q4_K_XL, tensors sum to 3021.88 MiB with a 1540.00 MiB
+        per-layer embedding and a 264.00 MiB ``token_embd`` that is tied, so the
+        original sits on the host and its duplicate on the card. Predicted device
+        weights 3021.88 - 1540.00 = 1481.88 MiB; llama-server reported CUDA0 at
+        1481.89 MiB. The host floor also never fell below 1804.00 MiB across
+        forced budgets of 6, 4, 3 and 2 GiB, which is exactly the two tensors.
+
+        Returns 0 for anything unreadable, which restores the old, conservative
+        budget. Counts EVERY shard of a split model: the n-gram embedding lives
+        in one shard of several, and missing it would leave the largest case
+        uncorrected.
+        """
+        try:
+            paths = LlamaCppBackend._gguf_shard_paths(model_path)
+            stats = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+        except OSError:
+            return 0
+        return LlamaCppBackend._host_pinned_weight_bytes_cached(stats)
+
+    @staticmethod
+    @functools.lru_cache(maxsize = 64)
+    def _host_pinned_weight_bytes_cached(stats: tuple) -> int:
+        try:
+            from gguf import GGUFReader
+
+            total = 0
+            for path, _size, _mtime in stats:
+                for tensor in GGUFReader(path).tensors:
+                    name = str(tensor.name)
+                    if name == "token_embd.weight" or name.startswith("per_layer_token_embd"):
+                        total += int(tensor.n_bytes)
+            return total
+        except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
+            logger.debug("host-pinned probe failed for %s (%s)", stats and stats[0][0], exc)
+            return 0
+
+    @staticmethod
+    def _override_moves_host_pinned(extra_args: Optional[Iterable[str]]) -> bool:
+        """True when a user ``-ot`` sends an input embedding somewhere not CPU.
+
+        The host pinning this budget relies on is unconditional in llama.cpp
+        (llama-model.cpp:1481-1483, "always keep it on the CPU"), and the
+        type-gated ``GET_ROWS`` support list is only ever consulted WITHIN the
+        list it was handed, which for these tensors is CPU-only.
+
+        The one thing that outranks it is an explicit override:
+        llama-model-loader.cpp:1182-1207 applies ``tensor_buft_overrides``
+        BEFORE the fallback, so a user pattern naming token_embd with a GPU
+        buffer type really does move it. Our own planner never emits one, but
+        extra_args belongs to the user. Discounting bytes that a flag has just
+        put on the card would be the one way this correction could over-commit,
+        so detect it and keep the conservative number.
+        """
+        if not extra_args:
+            return False
+        argv = [str(a) for a in extra_args]
+        values: list[str] = []
+        for i, tok in enumerate(argv):
+            if tok in ("-ot", "--override-tensor"):
+                if i + 1 < len(argv):
+                    values.append(argv[i + 1])
+            elif tok.startswith("--override-tensor="):
+                values.append(tok.split("=", 1)[1])
+        for spec in values:
+            # `pattern=buft`, and llama.cpp splits on the LAST '='.
+            pattern, _, buft = spec.rpartition("=")
+            if not pattern or buft.upper() == "CPU":
+                continue
+            if "token_embd" in pattern or "per_layer_token_embd" in pattern:
+                return True
+        return False
+
+    @staticmethod
+    def _gguf_shard_paths(model_path: str) -> "list[Path]":
+        """``model_path`` plus its sibling shards, in name order.
+
+        Mirrors the enumeration in ``_get_gguf_size_bytes``; kept separate so the
+        tensor probes see the same set of files the size does.
+        """
+        main = Path(model_path)
+        out = [main]
+        m = _SHARD_FULL_RE.match(main.name)
+        if m:
+            prefix, _, num_total = m.group(1), m.group(2), m.group(3)
+            sibling_pat = re.compile(
+                r"^" + re.escape(prefix) + r"-\d{5}-of-" + re.escape(num_total) + r"\.gguf$",
+                re.IGNORECASE,
+            )
+            for sibling in main.parent.iterdir():
+                if sibling != main and sibling_pat.match(sibling.name):
+                    out.append(sibling)
+        return sorted(out, key = lambda p: p.name)
+
+    @staticmethod
     def _tied_output_bytes(model_path: str) -> int:
         """Bytes llama.cpp allocates ON TOP of the file for a tied-embedding model.
 
@@ -7268,41 +7384,37 @@ class LlamaCppBackend:
         GGUF costs the old, slightly optimistic budget instead of a failed
         launch.
         """
-        # Split GGUF: shard 1 carries the metadata but only its own tensors, and
-        # GGUFReader maps the one path it is given. An ``output.weight`` living
-        # in shard 3 would read as "tied" here and add a duplicate that is not
-        # allocated -- the opposite error, and a much more expensive one on the
-        # very models big enough to be split. Abstain.
-        if _SHARD_FULL_RE.match(Path(model_path).name):
-            return 0
+        # Every shard, not just the one named. A GGUFReader maps only the path it
+        # is given, so on a split model an ``output.weight`` living in shard 3
+        # would read as "tied" from shard 1 and add a duplicate that is never
+        # allocated. Reading them all answers instead of abstaining.
         try:
-            stat = Path(model_path).stat()
+            paths = LlamaCppBackend._gguf_shard_paths(model_path)
+            stats = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
         except OSError:
             return 0
         # Keyed on identity, not just path: a model replaced in place keeps its
         # name, and the context search calls this once per candidate context, so
         # an uncached read of a 30 GB header would be paid on every step.
-        return LlamaCppBackend._tied_output_bytes_cached(
-            model_path, stat.st_size, stat.st_mtime_ns,
-        )
+        return LlamaCppBackend._tied_output_bytes_cached(stats)
 
     @staticmethod
     @functools.lru_cache(maxsize = 64)
-    def _tied_output_bytes_cached(model_path: str, _size: int, _mtime_ns: int) -> int:
+    def _tied_output_bytes_cached(stats: tuple) -> int:
         try:
             from gguf import GGUFReader
 
-            reader = GGUFReader(model_path)
             embd = 0
-            for tensor in reader.tensors:
-                name = str(tensor.name)
-                if name == "output.weight":
-                    return 0
-                if name == "token_embd.weight":
-                    embd = int(tensor.n_bytes)
+            for path, _size, _mtime in stats:
+                for tensor in GGUFReader(path).tensors:
+                    name = str(tensor.name)
+                    if name == "output.weight":
+                        return 0
+                    if name == "token_embd.weight":
+                        embd = int(tensor.n_bytes)
             return embd
         except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
-            logger.debug("tied-output probe failed for %s (%s)", model_path, exc)
+            logger.debug("tied-output probe failed for %s (%s)", stats and stats[0][0], exc)
             return 0
 
     @staticmethod
@@ -17867,7 +17979,36 @@ class LlamaCppBackend:
                     # card cannot hold. 264 MiB on gemma-4-E2B UD-Q4_K_XL and
                     # 924 MiB on gemma-4-31B UD-Q4_K_XL, against files of 3037
                     # and 17951 MiB.
-                    model_size = gguf_size + mmproj_size + self._tied_output_bytes(model_path)
+                    # What actually lands in VRAM, not what the file weighs.
+                    #
+                    # Up: a tied-embedding model allocates one more copy of the
+                    # embedding matrix than its file contains, because llama.cpp
+                    # re-creates output.weight from token_embd as
+                    # TENSOR_DUPLICATED.
+                    #
+                    # Down: token_embd itself never reaches the device
+                    # (llama.cpp pins dev_input to the CPU), and neither do the
+                    # per-layer / n-gram embeddings. On gemma-3n and
+                    # Qwen3.8-Flash-Next that is 26% to 67% of the file, so
+                    # charging it is what makes a runnable quant read as too big.
+                    #
+                    # Unified memory is excluded: there the "VRAM" IS host RAM,
+                    # so a host-pinned tensor occupies the same pool this budget
+                    # is spending and discounting it would double-count the room.
+                    from utils.hardware import is_apple_silicon
+
+                    _host_pinned = 0 if (
+                        is_apple_silicon()
+                        or self._amd_apu_wants_unified_memory(gpu_ids)
+                        or self._integrated_cuda_unified_memory(gpu_ids)
+                        or self._override_moves_host_pinned(extra_args)
+                    ) else self._host_pinned_weight_bytes(model_path)
+                    model_size = max(
+                        0,
+                        gguf_size + mmproj_size
+                        + self._tied_output_bytes(model_path)
+                        - _host_pinned,
+                    )
                     # 2-tuple gpus for existing logic + a total map for the absolute
                     # per-GPU headroom (correct when the GPU is already partly used).
                     # Pass binary so a Vulkan build probes ggml's Vulkan ordinals.
