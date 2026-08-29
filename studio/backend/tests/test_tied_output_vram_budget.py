@@ -255,6 +255,34 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
     assert "not (set(gpu_indices) & _shared_gpu_ids)" in src
 
 
+def test_a_draft_override_owns_only_the_drafter_discount(backend, tied_gguf):
+    expected = 8 * 64 * 4
+    draft_args = ["-otd", "token_embd.weight=CUDA0"]
+    main_args = ["-ot", "token_embd.weight=CUDA0"]
+
+    assert (
+        backend._host_pinned_vram_discount(
+            str(tied_gguf),
+            draft_args,
+            env = {},
+            shared_memory = False,
+            draft_model = True,
+        )
+        == 0
+    )
+    assert (
+        backend._host_pinned_vram_discount(
+            str(tied_gguf),
+            main_args,
+            env = {},
+            shared_memory = False,
+            draft_model = True,
+        )
+        == expected
+    )
+    assert backend._override_moves_host_pinned(draft_args, env = {}) is False
+
+
 def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monkeypatch):
     monkeypatch.setattr(
         backend,

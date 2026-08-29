@@ -319,7 +319,7 @@ def test_the_launch_charges_the_cpu_pinned_drafter_to_the_fit():
     )
     # ... and charged to the footprint as a HOST-ONLY term (free VRAM cannot pay for
     # an allocation the child only ever makes in RAM), abstaining when unpriceable.
-    assert "host_only_bytes=(_cpu_draft_fit_bytesor0)+_host_pinned" in compact
+    assert "+_host_pinned+_draft_host_pinned" in compact
     assert "or_cpu_draft_fit_bytesisNone" in compact
 
 
@@ -377,6 +377,25 @@ def test_a_cpu_pinned_drafter_is_not_paid_for_out_of_vram(monkeypatch):
         )
         == FIT_MODE
     )
+
+
+def test_gpu_drafter_host_pinned_embeddings_still_need_ram(monkeypatch):
+    """Discounting a GPU drafter's embeddings from VRAM moves them to the
+    host-only ledger; it does not erase them from the load-mode footprint."""
+    monkeypatch.setattr(hardware, "is_apple_silicon", lambda: False)
+    stub = _Stub(4 * 1024)
+
+    def _fit(host_only_bytes = 0):
+        return LlamaCppBackend._fit_derived_load_mode(
+            stub,
+            model_size = 8 * GIB,
+            gpus = [(0, 24 * 1024)],
+            avail_mib = 4 * 1024,
+            host_only_bytes = host_only_bytes,
+        )
+
+    assert _fit() == FIT_MODE
+    assert _fit(3 * GIB) is None
 
 
 # ------------------------------------------- the fitter's own VRAM margin

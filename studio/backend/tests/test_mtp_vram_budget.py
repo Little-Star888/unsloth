@@ -663,6 +663,13 @@ class TestExtraArgsMtpDetection:
         assert "_env_draft_for_budget=_extra_args_mtp_draft_path([],env=_spec_env)" in compact
         assert "_cli_draft_for_budgetor_studio_draft_for_budgetor_env_draft_for_budget" in compact
 
+    def test_load_model_discounts_host_pinned_drafter_weights(self):
+        compact = "".join(inspect.getsource(LlamaCppBackend.load_model).split())
+        assert "_draft_host_pinned=self._host_pinned_vram_discount(" in compact
+        assert "self._get_gguf_size_bytes(_mtp_draft_for_budget)-_draft_host_pinned" in compact
+        assert "draft_model=True" in compact
+        assert "shared_memory=_shared_memory" in compact
+
     def test_load_model_drops_cpu_offloaded_drafter_from_budget(self):
         # A SEPARATE drafter offloaded to CPU (--spec-draft-ngl 0 /
         # --spec-draft-device none) consumes no GPU, so it must be dropped from the

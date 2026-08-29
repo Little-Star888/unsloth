@@ -246,6 +246,34 @@ def test_auto_context_tries_a_discrete_singleton_before_a_mixed_prefix(tmp_path)
     assert result["cmd"][result["cmd"].index("-c") + 1] == "32768"
 
 
+@pytest.mark.parametrize("gpu_ids", [None, [0, 1]], ids = ["visible-pool", "explicit-pool"])
+def test_auto_context_compares_shared_and_discrete_singletons(tmp_path, gpu_ids):
+    """The first-ranked shared singleton fits only after shrinking context. Its
+    discrete peer fits the full context after the host-pinned discount, so Auto
+    must compare both one-card choices before accepting either."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 9_000, 9_000), (1, 8_000, 8_000)],
+    )
+    backend._read_gguf_metadata = lambda _path: setattr(backend, "_context_length", 32_768)
+    backend._get_gguf_size_bytes = lambda _path: 6 * gib
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 3 * gib
+    backend._amd_apu_wants_unified_memory = lambda ids = None: ids is None or 0 in ids
+    backend._integrated_cuda_unified_memory = lambda _ids = None: False
+    backend._torch_unified_memory_classification_known = lambda _ids = None: True
+    backend._can_estimate_kv = lambda: True
+    backend._estimate_kv_cache_bytes = lambda ctx, *_a, **_kw: 3 * gib * ctx // 32_768
+    backend._compute_buffer_ctx_bytes = lambda *_a, **_kw: 0
+    backend._estimate_compute_buffer_bytes = lambda **_kw: 1
+
+    result = _launch(backend, gguf, n_ctx = 0, gpu_ids = gpu_ids)
+
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert result["cmd"][result["cmd"].index("-c") + 1] == "32768"
+
+
 def test_pass_through_vulkan_pin_cancels_the_candidate_host_discount(tmp_path):
     """Auto budgets the discrete card, but Advanced Arguments are appended last.
     A pin to the filtered shared device must restore the host-pinned bytes."""
@@ -1176,14 +1204,14 @@ def test_an_unseen_pin_with_a_concrete_layer_count_still_stands_down(tmp_path):
     assert backend.spec_fallback_reason == "mtp_partial_offload"
 
 
-def _tight_vram_backend(tmp_path: Path, *, drafter_gb: float):
+def _tight_vram_backend(tmp_path: Path, *, drafter_gb: float, vulkan: bool = False):
     """One 24 GB card, a 16 GB target and a drafter of the caller's size.
 
     The fit terms are stubbed to constants so the only variable is whether the
     drafter's reserve clears the pin budget.
     """
     gb = 1024**3
-    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_576, 24_576)])
+    backend, gguf = _backend(tmp_path, vulkan = vulkan, memory = [(0, 24_576, 24_576)])
     sidecar = tmp_path / "dspark-model-Q8_0.gguf"
     sidecar.write_bytes(b"draft")
     backend._get_gguf_size_bytes = lambda path: (
@@ -2319,6 +2347,94 @@ def test_an_oversized_unmapped_load_is_remapped_instead_of_refused(
     assert cmd, "the unmapped oversized load never spawned llama-server"
     assert not _unmapped_tokens(cmd), f"the child still loads unmapped: {cmd}"
     assert "memory mapping instead" in (backend.last_load_warning or "")
+
+
+def test_host_pinned_weights_keep_an_unmapped_load_from_spending_surplus_vram(
+    tmp_path, monkeypatch
+):
+    """The card holds the discounted GPU-resident weights, but the embeddings
+    remain in RAM. Surplus VRAM cannot pay that host-only floor."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 12_000, 16_000)],
+    )
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 13 * gib
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 8 * gib
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 9_000)
+    )
+
+    cmd = _launch(backend, gguf, extra_args = ["--no-mmap"])["cmd"]
+
+    assert not _unmapped_tokens(cmd), cmd
+    assert "does not fit in GPU memory" in (backend.last_load_warning or "")
+    assert "memory mapping instead" in (backend.last_load_warning or "")
+
+
+def test_drafter_host_pinned_bytes_add_to_the_main_model_spill(tmp_path, monkeypatch):
+    gib = 1024**3
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 12_000, 16_000)])
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 13 * gib
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 9_000)
+    )
+
+    assert (
+        backend._launch_host_shortfall_message(
+            ["llama-server", "-m", str(gguf)],
+            [(0, 12_000)],
+            additional_host_only_bytes = 8 * gib,
+        )
+        is not None
+    )
+
+
+def test_a_cpu_drafter_is_included_in_the_normal_host_guard(tmp_path, monkeypatch):
+    """A drafter launched with zero GPU layers lives wholly in RAM even while the
+    target fits on its card. Its weights and cache must therefore make an oversized
+    unmapped launch pageable before the first spawn, without needing a CPU replay."""
+    gib = 1024**3
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_000, 24_000)])
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 8 * gib
+    draft_fit_paths = []
+
+    def _draft_fit(*_a, drafter_path = None, **_kw):
+        draft_fit_paths.append(drafter_path)
+        return 8 * gib if drafter_path else 0
+
+    backend._cpu_resident_draft_bytes = _draft_fit
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 4 * 1024)
+    )
+    drafter = tmp_path / "cpu-drafter.gguf"
+    drafter.write_bytes(b"draft")
+
+    cmd = _launch(
+        backend,
+        gguf,
+        extra_args = [
+            "--model-draft",
+            str(drafter),
+            "--gpu-layers-draft",
+            "0",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert str(drafter) in draft_fit_paths, draft_fit_paths
+    assert not _unmapped_tokens(cmd), cmd
+    assert "About 8 GB" in (backend.last_load_warning or "")
 
 
 @pytest.mark.parametrize("extra_args", _UNMAPPED_ARGV, ids = _UNMAPPED_IDS)
@@ -3487,6 +3603,91 @@ def test_a_vulkan_load_that_never_falls_back_keeps_its_own_advisory(tmp_path, mo
     warning = backend.last_load_warning or ""
     assert "About 12 GB" in warning, warning
     assert "About 20 GB" not in warning, warning
+
+
+def test_a_cpu_replay_prices_the_whole_gpu_drafter_against_ram(tmp_path, monkeypatch):
+    """The GPU launch keeps a separate drafter in VRAM, but a Vulkan crash moves
+    both models to the CPU. The replay therefore has to charge the drafter's full
+    weights and cache, not only the embedding floor pinned by its GPU placement."""
+    gib = 1024**3
+    backend, gguf = _vulkan_cpu_replay_backend(
+        tmp_path, monkeypatch, gguf_gb = 8.0, free_mib = 24 * 1024, avail_mib = 12 * 1024
+    )
+    drafter = tmp_path / "drafter.gguf"
+    drafter.write_bytes(b"draft")
+    backend.probe_server_capabilities = lambda _binary: {
+        "found": True,
+        "spec_draft_ngl_flag": "--gpu-layers-draft",
+    }
+    backend._cpu_resident_draft_bytes = lambda *_a, drafter_path = None, **_kw: (
+        8 * gib if drafter_path else 0
+    )
+
+    captured = _launch_with_vulkan_cpu_replay(
+        backend,
+        gguf,
+        extra_args = ["--model-draft", str(drafter), "--no-mmap"],
+    )
+
+    gpu_attempt, replay = captured["cmds"][0], captured["cmds"][-1]
+    assert _unmapped_tokens(gpu_attempt) == ["--no-mmap"], gpu_attempt
+    assert not _unmapped_tokens(replay), replay
+    assert replay[replay.index("--gpu-layers-draft") + 1] == "0", replay
+    assert "About 16 GB" in (backend.last_load_warning or "")
+
+
+def test_a_cpu_replay_does_not_charge_an_auto_dropped_drafter(tmp_path, monkeypatch):
+    """Auto drops a drafter that cannot share the card with the target. A later
+    Vulkan crash replays only the target on CPU, so the dropped sidecar must not
+    force mapping or produce a host warning for bytes the final argv never loads."""
+    gib = 1024**3
+    backend, gguf, sidecar = _tight_vram_backend(tmp_path, drafter_gb = 12.0, vulkan = True)
+    _restore_host_guard(backend)
+    backend._cpu_resident_draft_bytes = lambda *_a, drafter_path = None, **_kw: (
+        12 * gib if drafter_path else 0
+    )
+    backend._run_vulkan_probe = lambda _binary = None: [
+        {
+            "index": 0,
+            "name": "Vulkan0",
+            "free_mib": 24_576,
+            "total_mib": 24_576,
+            "is_igpu": False,
+        }
+    ]
+    backend._get_gpu_free_memory_vulkan = lambda _binary = None, **_kw: [
+        (0, 24_576, 24_576)
+    ]
+    backend._vulkan_rows_target_igpus = lambda *_a, **_kw: False
+    backend._vulkan_auto_gpu_memory = lambda rows: list(rows)
+    backend._cpu_isolated_binary = lambda _binary: "/fake/llama-server"
+    backend._llama_server_env_for_binary = lambda _binary: {_loader_path_var(): ""}
+    backend._record_server_pid = lambda _pid: None
+    backend._clear_server_pid = lambda: None
+    monkeypatch.setattr(
+        LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda _binary = None: True)
+    )
+    monkeypatch.setattr(
+        LlamaCppBackend, "_vulkan_prebuilt_was_auto_selected", staticmethod(lambda _binary: True)
+    )
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 20 * 1024)
+    )
+
+    captured = _launch_with_vulkan_cpu_replay(
+        backend,
+        gguf,
+        dspark_draft_path = str(sidecar),
+        speculative_type = "auto",
+        n_ctx = 8192,
+        extra_args = ["--no-mmap"],
+    )
+
+    gpu_attempt, replay = captured["cmds"][0], captured["cmds"][-1]
+    assert "--model-draft" not in gpu_attempt
+    assert "--model-draft" not in replay
+    assert _unmapped_tokens(replay) == ["--no-mmap"], replay
+    assert backend.last_load_warning is None
 
 
 def test_the_cpu_reprice_carries_the_pageable_override_note_it_did_not_revert(
