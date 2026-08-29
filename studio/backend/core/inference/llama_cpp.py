@@ -7408,7 +7408,9 @@ class LlamaCppBackend:
             return 0
 
     def _separate_drafter_weight_vram_bytes(
-        self, model_path: str, host_pinned_bytes: int = 0
+        self,
+        model_path: str,
+        host_pinned_bytes: int = 0,
     ) -> int:
         """Weight bytes a separate GPU drafter actually allocates in VRAM."""
         return max(
@@ -18585,11 +18587,9 @@ class LlamaCppBackend:
                                 _mtp_draft_for_budget,
                                 _draft_host_pinned,
                             )
-                            _mtp_draft_weights_candidate = (
-                                self._separate_drafter_weight_vram_bytes(
-                                    _mtp_draft_for_budget,
-                                    _draft_host_pinned_candidate,
-                                )
+                            _mtp_draft_weights_candidate = self._separate_drafter_weight_vram_bytes(
+                                _mtp_draft_for_budget,
+                                _draft_host_pinned_candidate,
                             )
                         except Exception:
                             _draft_host_pinned = 0
@@ -18617,14 +18617,13 @@ class LlamaCppBackend:
                                 f"vulkan{idx}" for idx in _candidate_ids
                             }:
                                 return 0
-                        return max(
-                            0, _mtp_draft_weights - _mtp_draft_weights_candidate
-                        )
+                        return max(0, _mtp_draft_weights - _mtp_draft_weights_candidate)
 
                     def _candidate_host_pinned_delta(candidate_ids) -> int:
                         return _candidate_target_host_pinned_delta(
                             candidate_ids
                         ) + _candidate_draft_host_pinned_delta(candidate_ids)
+
                     # Draft K/V types (f16 by default; independent extras overrides).
                     _mtp_draft_ck, _mtp_draft_cv = _extra_args_draft_cache_types(extra_args)
                     # The control underneath them: emitted before the extras, so an
@@ -20154,9 +20153,7 @@ class LlamaCppBackend:
                     # above already used.
                     if (
                         gpu_indices
-                        and not (
-                            set(gpu_indices) & (_shared_gpu_ids | _unclassified_gpu_ids)
-                        )
+                        and not (set(gpu_indices) & (_shared_gpu_ids | _unclassified_gpu_ids))
                         and (
                             _host_pinned_candidate > _host_pinned
                             or _draft_host_pinned_candidate > _draft_host_pinned
@@ -20164,8 +20161,8 @@ class LlamaCppBackend:
                         )
                     ):
                         _new_target_discount = _candidate_target_host_pinned_delta(gpu_indices)
-                        _candidate_draft_discount_applied = (
-                            _candidate_draft_host_pinned_delta(gpu_indices)
+                        _candidate_draft_discount_applied = _candidate_draft_host_pinned_delta(
+                            gpu_indices
                         )
                         _host_pinned += _new_target_discount
                         _draft_host_pinned += _candidate_draft_discount_applied
@@ -20175,9 +20172,7 @@ class LlamaCppBackend:
                         model_size = max(0, model_size - _new_target_discount)
                         model_size_fit = max(
                             0,
-                            model_size_fit
-                            - _new_target_discount
-                            - _shared_pool_mmproj,
+                            model_size_fit - _new_target_discount - _shared_pool_mmproj,
                         )
                         _shared_pool_mmproj = 0
 

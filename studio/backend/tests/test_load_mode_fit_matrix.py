@@ -1681,8 +1681,7 @@ def test_a_partial_draft_offload_leaves_the_drafter_unsized():
     compact = "".join(inspect.getsource(B.load_model).split())
     assert (
         "_draft_split_across_host=bool(_mtp_will_engageand_mtp_draft_for_budget"
-        "and_draft_is_split_across_host("
-        in compact
+        "and_draft_is_split_across_host(" in compact
     )
     # The same effective views the other overrides are classified on.
     assert "_draft_is_split_across_host(_fit_extras,_fit_env," in compact
