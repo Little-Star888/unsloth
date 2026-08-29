@@ -19603,12 +19603,8 @@ class LlamaCppBackend:
 
                     if tensor_parallel and tp_gpus:
                         _tp_candidate_ids = [idx for idx, _free in tp_gpus]
-                        _tp_target_discount = _candidate_target_host_pinned_delta(
-                            _tp_candidate_ids
-                        )
-                        _tp_draft_discount = _candidate_draft_host_pinned_delta(
-                            _tp_candidate_ids
-                        )
+                        _tp_target_discount = _candidate_target_host_pinned_delta(_tp_candidate_ids)
+                        _tp_draft_discount = _candidate_draft_host_pinned_delta(_tp_candidate_ids)
                         _tp_model_size = max(
                             0,
                             model_size - _tp_target_discount,
@@ -19617,9 +19613,7 @@ class LlamaCppBackend:
                         def _tp_mtp_bytes(ctx: int) -> int:
                             return max(0, _mtp_bytes(ctx) - _tp_draft_discount)
 
-                        _tp_mtp_overhead_fn = (
-                            _tp_mtp_bytes if mtp_overhead_fn is not None else None
-                        )
+                        _tp_mtp_overhead_fn = _tp_mtp_bytes if mtp_overhead_fn is not None else None
                         # Pooled usable budget (after each device's compute buffer)
                         # must hold the non-shrinkable footprint: weights + the MTP
                         # reserve. The planner can shrink ctx/KV, not these.
