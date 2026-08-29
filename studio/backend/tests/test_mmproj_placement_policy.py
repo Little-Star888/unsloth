@@ -312,8 +312,7 @@ def test_discrete_mtp_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_p
     discounted = [row for row in mtp_fallbacks if row[1] < 8 * GIB]
     assert discounted
     assert all(
-        requested == 16_384 and fitted == requested
-        for requested, _base, fitted in discounted
+        requested == 16_384 and fitted == requested for requested, _base, fitted in discounted
     )
     assert "--model-draft" in result["cmd"]
     assert int(result["cmd"][result["cmd"].index("-c") + 1]) == 16_384

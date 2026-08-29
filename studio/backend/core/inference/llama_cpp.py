@@ -19071,9 +19071,7 @@ class LlamaCppBackend:
                         )
                         _mm_min_gpus = max(1, min(_layer_min_gpus, len(_mm_ranked)))
                         _mm_needs_fit = True
-                        for _mm_subset in _ranked_candidate_subsets(
-                            _mm_ranked, _mm_min_gpus
-                        ):
+                        for _mm_subset in _ranked_candidate_subsets(_mm_ranked, _mm_min_gpus):
                             _mm_need = _mm_base_need - _candidate_host_pinned_delta(
                                 [_idx for _idx, _free in _mm_subset]
                             )
