@@ -7602,9 +7602,11 @@ class LlamaCppBackend:
             return conservative_on_unknown
         wanted = set(gpu_indices) if gpu_indices else None
         selected = [r for r in rows if wanted is None or r["index"] in wanted]
-        if wanted is not None and conservative_on_unknown and {
-            r["index"] for r in selected
-        } != wanted:
+        if (
+            wanted is not None
+            and conservative_on_unknown
+            and {r["index"] for r in selected} != wanted
+        ):
             return conservative_on_unknown
         return any(r["is_igpu"] for r in selected)
 

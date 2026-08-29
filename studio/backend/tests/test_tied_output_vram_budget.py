@@ -244,9 +244,9 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
     )
 
     src = inspect.getsource(backend)
-    assert "+ self._tied_output_bytes(model_path)" in src, (
-        "the context budget no longer charges the tied-embedding duplicate"
-    )
+    assert (
+        "+ self._tied_output_bytes(model_path)" in src
+    ), "the context budget no longer charges the tied-embedding duplicate"
     assert "- _host_pinned," in src, "the context budget no longer discounts host-pinned embeddings"
     assert "_host_pinned_vram_discount(" in src
     assert "env = os.environ" in src
@@ -268,12 +268,7 @@ def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monke
     assert backend._vulkan_targets_are_igpus("server", [1]) is False
     assert backend._vulkan_targets_are_igpus("server", [2], conservative_on_unknown = True) is True
     assert backend._vulkan_targets_are_igpus("server", [1, 2]) is False
-    assert (
-        backend._vulkan_targets_are_igpus(
-            "server", [1, 2], conservative_on_unknown = True
-        )
-        is True
-    )
+    assert backend._vulkan_targets_are_igpus("server", [1, 2], conservative_on_unknown = True) is True
 
     monkeypatch.setattr(backend, "_run_vulkan_probe", staticmethod(lambda _binary = None: []))
     assert backend._vulkan_targets_are_igpus("server", conservative_on_unknown = True) is True
@@ -315,9 +310,7 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
         is True
     )
     assert (
-        backend._override_moves_host_pinned(
-            [], env = {"LLAMA_ARG_OVERRIDE_TENSOR": "embd=CUDA0"}
-        )
+        backend._override_moves_host_pinned([], env = {"LLAMA_ARG_OVERRIDE_TENSOR": "embd=CUDA0"})
         is True
     )
 
