@@ -814,9 +814,7 @@ def _run_auto_load(
     if capture is not None:
         capture["backend"] = backend
     backend._read_gguf_metadata = lambda _path: (
-        setattr(backend, "_context_length", context_length)
-        if context_length is not None
-        else None
+        setattr(backend, "_context_length", context_length) if context_length is not None else None
     )
     backend._can_estimate_kv = lambda: kv_bytes_stub is not None
     if kv_bytes_stub is not None:
@@ -2238,9 +2236,7 @@ class TestArchCrashRetryRechecksTheApuRamGuard:
         )
 
         first_cmd = launches[0][0]
-        retry_cmd = next(
-            cmd for cmd, env in launches if env.get("ROCR_VISIBLE_DEVICES") == "1"
-        )
+        retry_cmd = next(cmd for cmd, env in launches if env.get("ROCR_VISIBLE_DEVICES") == "1")
         assert first_cmd[first_cmd.index("-c") + 1] == "32768"
         assert first_cmd[first_cmd.index("--fit") + 1] == "off"
         assert "--no-mmap" in first_cmd

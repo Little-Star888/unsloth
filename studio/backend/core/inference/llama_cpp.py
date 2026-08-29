@@ -22940,9 +22940,7 @@ class LlamaCppBackend:
                             and _retry_rows
                         ):
                             _retry_n_gpus = len(_retry_rows)
-                            _retry_budget_mib = _pool_budget_mib(
-                                _retry_rows, _pin_fraction
-                            )
+                            _retry_budget_mib = _pool_budget_mib(_retry_rows, _pin_fraction)
                             _retry_model_size_fit = (
                                 model_size_fit
                                 + _host_pinned
@@ -22976,15 +22974,8 @@ class LlamaCppBackend:
                             _retry_fit_proved = (
                                 _retry_footprint_mib <= _retry_budget_mib
                                 and self._every_gpu_holds_reserve(
-                                    (
-                                        _gpu_usable(g, _pin_fraction)
-                                        for g in _retry_rows
-                                    ),
-                                    (
-                                        _pipeline_overhead_bytes
-                                        if _retry_n_gpus > 1
-                                        else 0
-                                    )
+                                    (_gpu_usable(g, _pin_fraction) for g in _retry_rows),
+                                    (_pipeline_overhead_bytes if _retry_n_gpus > 1 else 0)
                                     + _retry_cc(_retry_ctx) // _retry_n_gpus,
                                 )
                             )
@@ -22995,9 +22986,7 @@ class LlamaCppBackend:
                                 if _ctx_pos + 1 < len(cmd):
                                     cmd[_ctx_pos + 1] = str(_retry_ctx)
                                     effective_ctx = _retry_ctx
-                                    max_available_ctx = min(
-                                        max_available_ctx, _retry_ctx
-                                    )
+                                    max_available_ctx = min(max_available_ctx, _retry_ctx)
                                     # The initial placement published these before
                                     # the first spawn. Keep status, prompt fitting,
                                     # and default max_tokens bound to the command the
