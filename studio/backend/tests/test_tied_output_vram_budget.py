@@ -244,9 +244,9 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
     )
 
     src = inspect.getsource(backend)
-    assert "+ self._tied_output_bytes(model_path)" in src, (
-        "the context budget no longer charges the tied-embedding duplicate"
-    )
+    assert (
+        "+ self._tied_output_bytes(model_path)" in src
+    ), "the context budget no longer charges the tied-embedding duplicate"
     assert "- _host_pinned" in src, "the context budget no longer discounts host-pinned embeddings"
     assert "_host_pinned_vram_discount(" in src
     assert "env = os.environ" in src
