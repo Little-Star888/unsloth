@@ -735,6 +735,12 @@ class TestExtraArgsMtpDetection:
             (["--spec-draft-ngl", "-1", "--spec-draft-ngl", "0"], True),  # last = CPU
             (["--spec-draft-device", "CUDA0", "--spec-draft-device", "none"], True),
             (["--spec-draft-device", "none", "--spec-draft-device", "CUDA0"], False),
+            # A separate drafter inherits the main device when no draft-specific
+            # override is present; load_model emits that inherited pin later.
+            (["--device", "none"], True),
+            (["--device", "CPU"], True),
+            # An explicit draft placement still wins over the inherited main pin.
+            (["--device", "none", "--spec-draft-device", "CUDA0"], False),
         ],
     )
     def test_draft_offloaded_to_cpu(self, args, expected):

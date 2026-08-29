@@ -344,6 +344,61 @@ def test_pass_through_vulkan_pin_cancels_the_candidate_host_discount(tmp_path):
     assert cmd[-2:] == ["--device", "Vulkan1"]
 
 
+def test_auto_vulkan_spill_uses_the_final_discrete_pin_accounting(tmp_path):
+    """Auto can leave --fit enabled over a mixed visible pool, then pin only the
+    detected dGPU. The spill snapshot must describe that final placement."""
+    rows = [
+        {
+            "index": 0,
+            "free_mib": 12_000,
+            "total_mib": 16_000,
+            "is_igpu": False,
+            "name": "Vulkan0",
+        },
+        {
+            "index": 1,
+            "free_mib": 1_000,
+            "total_mib": 1_000,
+            "is_igpu": True,
+            "name": "Vulkan1",
+        },
+    ]
+    backend, gguf = _backend(tmp_path, vulkan = True, memory = [])
+    backend._run_vulkan_probe = lambda *_a, **_kw: rows
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 100
+    backend._select_gpus = lambda *_a, **_kw: (None, True)
+    captured = {}
+    backend._planned_tensor_spill = lambda inputs, **_kw: captured.update(inputs) or None
+
+    cmd = _launch(backend, gguf)["cmd"]
+
+    assert cmd[cmd.index("--device") + 1] == "Vulkan0"
+    assert captured["gpu_indices"] == [0]
+    assert captured["model_size"] == 1024 - 100
+    assert captured["shared_gpu_ids"] == set()
+
+
+def test_shared_memory_auto_spill_keeps_its_unpinned_abstention(tmp_path):
+    """A non-Vulkan shared-memory Auto load has no late discrete pin. Its spill
+    snapshot must keep the shared device so the planner abstains."""
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 12_000, 16_000)],
+    )
+    backend._amd_apu_wants_unified_memory = lambda *_a, **_kw: True
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: (None, True)
+    captured = {}
+    backend._planned_tensor_spill = lambda inputs, **_kw: captured.update(inputs) or None
+
+    _launch(backend, gguf)
+
+    assert captured["gpu_indices"] is None
+    assert captured["shared_gpu_ids"] == {0}
+
+
 def test_vulkan_selection_uses_ordinals_and_owns_device_flags(tmp_path):
     backend, gguf = _backend(
         tmp_path,
@@ -2508,6 +2563,81 @@ def test_a_cpu_drafter_is_included_in_the_normal_host_guard(tmp_path, monkeypatc
     assert str(drafter) in draft_fit_paths, draft_fit_paths
     assert not _unmapped_tokens(cmd), cmd
     assert "About 8 GB" in (backend.last_load_warning or "")
+
+
+def test_a_separate_drafter_inherits_the_main_cpu_pin_in_the_host_guard(tmp_path, monkeypatch):
+    """The launcher copies a main CPU device to a separate drafter when no
+    draft-specific device was supplied, so preflight must price the same placement."""
+    gib = 1024**3
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_000, 24_000)])
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 1 * gib
+    backend._cpu_resident_draft_bytes = lambda *_a, drafter_path = None, **_kw: (
+        8 * gib if drafter_path else 0
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    backend.probe_server_capabilities = lambda _binary = None: {
+        "mtp_token": "draft-mtp",
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+    }
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 4 * 1024)
+    )
+    drafter = tmp_path / "inherited-cpu-drafter.gguf"
+    drafter.write_bytes(b"draft")
+    backend._resolve_launch_mtp_path = lambda **_kwargs: str(drafter)
+
+    cmd = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(drafter),
+        speculative_type = "mtp",
+        extra_args = [
+            "--device",
+            "none",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert cmd[cmd.index("--spec-draft-device") + 1].lower() == "none"
+    assert not _unmapped_tokens(cmd), cmd
+    assert "About 8 GB" in (backend.last_load_warning or "")
+
+
+def test_an_unsized_cpu_drafter_makes_an_unmapped_load_pageable(tmp_path, monkeypatch):
+    """An engaged CPU drafter whose footprint cannot be read cannot be proved to
+    fit host RAM; preserve the conservative pageable-load safety valve."""
+    gib = 1024**3
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_000, 24_000)])
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 1 * gib
+    backend._cpu_resident_draft_bytes = lambda *_a, drafter_path = None, **_kw: (
+        None if drafter_path else 0
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 64 * 1024)
+    )
+    drafter = tmp_path / "unsized-cpu-drafter.gguf"
+    drafter.write_bytes(b"draft")
+
+    cmd = _launch(
+        backend,
+        gguf,
+        extra_args = [
+            "--model-draft",
+            str(drafter),
+            "--spec-draft-device",
+            "cpu",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert not _unmapped_tokens(cmd), cmd
 
 
 @pytest.mark.parametrize("extra_args", _UNMAPPED_ARGV, ids = _UNMAPPED_IDS)

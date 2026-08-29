@@ -4506,10 +4506,11 @@ def _extra_args_draft_offloaded_to_cpu(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> bool:
     """True if the SEPARATE draft model is on CPU (so the budget must not charge
-    its weights+KV): --spec-draft-ngl 0, or --spec-draft-device naming only
-    cpu/none, else the LLAMA_ARG_N_GPU_LAYERS_DRAFT env the child honors (the
-    device flag has no env). An embedded MTP head follows the main -ngl, so these
-    draft-only flags don't move it. Last-wins, so only each flag's final value counts.
+    its weights+KV): --spec-draft-ngl 0, a draft device naming only cpu/none, or
+    an inherited main CPU device when no draft-specific device overrides it; else
+    the LLAMA_ARG_N_GPU_LAYERS_DRAFT env the child honors (device flags have no env).
+    An embedded MTP head follows the main -ngl, so these draft-only flags don't move
+    it. Last-wins, so only each flag's final value counts.
 
     A count BETWEEN 0 and the drafter's block count is a split, not an offload; see
     ``_draft_is_split_across_host``."""
@@ -4521,6 +4522,8 @@ def _extra_args_draft_offloaded_to_cpu(
         except (TypeError, ValueError):
             pass
     last_dev = _extra_args_draft_device(extra_args)
+    if last_dev is None:
+        last_dev = _extra_args_main_device(extra_args)
     if last_dev is not None:
         devs = [d.strip().lower() for d in last_dev.split(",") if d.strip()]
         if devs and all(d in ("cpu", "none") for d in devs):
@@ -20835,6 +20838,29 @@ class LlamaCppBackend:
                 ):
                     gpu_indices = sorted(idx for idx, _free in _detected_gpus)
 
+                    # Auto Vulkan can leave --fit on over a mixed visible pool,
+                    # then narrow the actual child to the detected dGPU set only
+                    # here. The spill snapshot was taken before that final pin, so
+                    # make its candidate-specific discounts and reachability
+                    # describe the argv that will launch rather than the wider
+                    # discovery pool. Other backends with no final pin must retain
+                    # their shared-memory abstention.
+                    if _spill_inputs is not None:
+                        _apply_candidate_discounts(gpu_indices)
+                        _mtp_reserve_bytes = (
+                            _mtp_bytes(effective_ctx, n_parallel, _effective_ubatch)
+                            if _mtp_will_engage
+                            else 0
+                        )
+                        _spill_inputs["model_size"] = model_size
+                        _spill_inputs["gpu_indices"] = gpu_indices
+                        _spill_inputs["extra_gpu_bytes"] = (
+                            mmproj_size + _shared_pool_mmproj + _mtp_reserve_bytes
+                        )
+                        _spill_inputs["shared_gpu_ids"] = set(
+                            _shared_gpu_ids or ()
+                        ) & set(gpu_indices)
+
                 # Status reports the explicit subset the launch actually uses,
                 # while reload dedupe compares requested_gpu_ids so repeating a
                 # wider request that fit narrowed does not restart the server.
@@ -22476,6 +22502,11 @@ class LlamaCppBackend:
                     hides a message, and hiding a message must not withdraw the rewrite
                     that makes the load possible.
                     """
+                    # None is the engaged-but-unsized CPU-drafter state. It cannot
+                    # prove an unmapped load fits RAM, so keep the demand-paging
+                    # safety valve even though no byte-precise warning is possible.
+                    if _cpu_draft_fit_bytes is None:
+                        return True
                     if _apu_ram_oversized or _offload_msg:
                         return True
                     if not self._host_offload_warning_opted_out():
@@ -23548,6 +23579,8 @@ class LlamaCppBackend:
                         # allocate the whole model in host RAM and be OOM-killed. Same
                         # condition, same helper, before the respawn rather than after.
                         def _retry_is_oversized() -> bool:
+                            if _cpu_draft_fit_bytes is None:
+                                return True
                             if _retry_apu_msg or _retry_host_msg:
                                 return True
                             # The opt-out silences the message, never the rewrite.
