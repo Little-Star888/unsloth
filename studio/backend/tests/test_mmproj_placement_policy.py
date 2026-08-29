@@ -102,7 +102,10 @@ def _backend(
     # resolution has to come back empty or MTP engages behind the scenes.
     backend._resolve_launch_mtp_path = lambda **_kw: str(drafter) if drafter_bytes else None
     backend._apu_ram_shortfall_message = lambda *_a, **_kw: None
-    backend._amd_apu_wants_unified_memory = lambda *_a, **_kw: False
+    shared_ids = {idx for idx, _free, total in memory if total <= 0}
+    backend._amd_apu_wants_unified_memory = lambda ids = None: (
+        bool(shared_ids) if ids is None else bool(set(ids) & shared_ids)
+    )
     backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
     backend._is_vulkan_backend = lambda _binary = None: False
     backend._wait_for_health = lambda timeout, **_kw: True
@@ -282,23 +285,15 @@ def test_discrete_mtp_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_p
     its drafter. When that exact subset holds both, Auto must retain the drafter."""
     backend, gguf = _backend(
         tmp_path,
-        memory = [(0, 9_500, 16_384), (1, 1_000, 0)],
+        memory = [(0, 11_000, 16_384), (1, 1_000, 0)],
         drafter_bytes = 2 * GIB,
         native_ctx = 16_384,
     )
     backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
     backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
-    backend._host_pinned_vram_discount = lambda *_a, **_kw: 3 * GIB
-    real_fit = backend._fit_context_to_vram
-    mtp_fallbacks = []
-
-    def record_fit(*args, **kwargs):
-        fitted = real_fit(*args, **kwargs)
-        if kwargs.get("mtp_engaged") and kwargs.get("pooled"):
-            mtp_fallbacks.append((args[0], args[2], fitted))
-        return fitted
-
-    backend._fit_context_to_vram = record_fit
+    backend._host_pinned_vram_discount = lambda *_a, draft_model = False, **_kw: (
+        2 * GIB if draft_model else 0
+    )
 
     result = _launch(
         backend,
@@ -308,12 +303,8 @@ def test_discrete_mtp_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_p
     )
 
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
-    # Without the 3 GiB candidate discount this fallback base is over 8 GiB.
-    discounted = [row for row in mtp_fallbacks if row[1] < 8 * GIB]
-    assert discounted
-    assert all(
-        requested == 16_384 and fitted == requested for requested, _base, fitted in discounted
-    )
+    # The raw 2 GiB sidecar does not fit in this budget, but its host-pinned
+    # embedding is the whole fixture, so the dGPU candidate pays none of it.
     assert "--model-draft" in result["cmd"]
     assert int(result["cmd"][result["cmd"].index("-c") + 1]) == 16_384
 
@@ -331,7 +322,9 @@ def test_drafter_drop_probe_tries_a_lower_ranked_discrete_singleton(tmp_path):
     )
     backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
     backend._torch_unified_memory_classification_known = lambda ids = None: ids == [1]
-    backend._host_pinned_vram_discount = lambda *_a, **_kw: 5 * GIB
+    backend._host_pinned_vram_discount = lambda *_a, draft_model = False, **_kw: (
+        0 if draft_model else 5 * GIB
+    )
 
     result = _launch(
         backend,
@@ -343,6 +336,39 @@ def test_drafter_drop_probe_tries_a_lower_ranked_discrete_singleton(tmp_path):
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     assert "--model-draft" not in result["cmd"]
     assert backend.spec_fallback_reason == "drafter_no_vram"
+
+
+def test_a_dropped_partial_drafter_does_not_make_the_load_mode_unsized(tmp_path):
+    backend, gguf = _backend(
+        tmp_path,
+        memory = [(0, 3_000, 16_384), (1, 2_900, 16_384)],
+        mmproj_bytes = 0,
+        drafter_bytes = 2 * GIB,
+        native_ctx = 8_192,
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [1]
+    backend._host_pinned_vram_discount = lambda *_a, draft_model = False, **_kw: (
+        0 if draft_model else 5 * GIB
+    )
+    backend._draft_backend_for = lambda _path: SimpleNamespace(
+        _n_layers = 32,
+        _can_estimate_kv = lambda: True,
+        _estimate_kv_cache_bytes = lambda *_a, **_kw: 1,
+    )
+    fit_inputs = []
+    backend._fit_derived_load_mode = lambda **kwargs: fit_inputs.append(kwargs) or None
+
+    result = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(tmp_path / "mtp.gguf"),
+        speculative_type = "auto",
+        extra_args = ["--spec-draft-ngl", "1"],
+    )
+
+    assert "--model-draft" not in result["cmd"]
+    assert fit_inputs and fit_inputs[-1]["mtp_unsized"] is False
 
 
 # The drafter tests share one shape: a small native context so the drop probe
@@ -1396,6 +1422,28 @@ def test_a_pinned_projector_costs_the_shared_pool_beside_a_discrete_card(tmp_pat
     ref_cmd = _launch(reference, ref_gguf)["cmd"]
 
     assert pinned_ctx == int(ref_cmd[ref_cmd.index("-c") + 1])
+
+
+def test_a_pinned_projector_is_removed_from_a_discrete_subset_budget(tmp_path):
+    """A visible shared heap keeps the global fit conservative, but once Auto
+    selects only the dGPU the CPU projector consumes none of that card's VRAM."""
+    memory = [(0, 1_000, 0), (1, 9_000, 16_384)]
+
+    backend, gguf = _backend(tmp_path, memory = memory)
+    backend._amd_apu_wants_unified_memory = lambda ids = None: ids is None or ids == [0]
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [1]
+    result = _launch(backend, gguf, extra_args = ["--no-mmproj-offload"])
+    pinned_ctx = int(result["cmd"][result["cmd"].index("-c") + 1])
+
+    reference, ref_gguf = _backend(tmp_path, memory = memory, mmproj_bytes = 0)
+    reference._amd_apu_wants_unified_memory = lambda ids = None: ids is None or ids == [0]
+    reference._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    reference._torch_unified_memory_classification_known = lambda ids = None: ids == [1]
+    ref_result = _launch(reference, ref_gguf)
+
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert pinned_ctx == int(ref_result["cmd"][ref_result["cmd"].index("-c") + 1])
 
 
 def _estimator_config(model_path, mmproj_path = None):

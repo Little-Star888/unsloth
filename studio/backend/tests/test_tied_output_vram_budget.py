@@ -120,6 +120,15 @@ def test_a_model_shipping_its_own_output_is_charged_nothing(backend, untied_gguf
     assert backend._tied_output_bytes(str(untied_gguf)) == 0
 
 
+def test_a_separate_tied_drafter_charges_its_duplicated_output(backend, tied_gguf):
+    instance = backend()
+    embedding = 8 * 64 * 4
+    raw_size = instance._get_gguf_size_bytes(str(tied_gguf))
+
+    assert instance._separate_drafter_weight_vram_bytes(str(tied_gguf), embedding) == raw_size
+    assert instance._separate_drafter_weight_vram_bytes(str(tied_gguf), 0) == raw_size + embedding
+
+
 def test_the_charge_is_the_embedding_size_not_a_constant(backend, tmp_path):
     """Two tied models of different vocabulary sizes must differ.
 
@@ -252,7 +261,7 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
     assert "env = os.environ" in src
     assert "shared_memory = False" in src
     assert "_host_pinned = 0 if _shared_memory else _host_pinned_candidate" in src
-    assert "not (set(gpu_indices) & _shared_gpu_ids)" in src
+    assert "set(gpu_indices) & (_shared_gpu_ids | _unclassified_gpu_ids)" in src
 
 
 def test_a_draft_override_owns_only_the_drafter_discount(backend, tied_gguf):
@@ -394,7 +403,9 @@ def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch):
     assert backend._torch_unified_memory_classification_known([0]) is False
 
 
-@pytest.mark.parametrize("arch", ["gfx1031", "gfx1100"])
+@pytest.mark.parametrize(
+    "arch", ["gfx906", "gfx908", "gfx90a", "gfx942", "gfx1031", "gfx1100"]
+)
 def test_a_known_discrete_rocm_arch_is_proved_discrete(backend, monkeypatch, arch):
     class _Props:
         gcnArchName = arch

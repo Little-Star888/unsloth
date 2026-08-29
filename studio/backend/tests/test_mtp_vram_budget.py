@@ -665,10 +665,14 @@ class TestExtraArgsMtpDetection:
 
     def test_load_model_discounts_host_pinned_drafter_weights(self):
         compact = "".join(inspect.getsource(LlamaCppBackend.load_model).split())
-        assert "_draft_host_pinned=self._host_pinned_vram_discount(" in compact
-        assert "self._get_gguf_size_bytes(_mtp_draft_for_budget)-_draft_host_pinned" in compact
+        assert "_draft_host_pinned_candidate=self._host_pinned_vram_discount(" in compact
+        assert (
+            "self._separate_drafter_weight_vram_bytes("
+            "_mtp_draft_for_budget,_draft_host_pinned" in compact
+        )
         assert "draft_model=True" in compact
-        assert "shared_memory=_shared_memory" in compact
+        assert "shared_memory=False" in compact
+        assert "_candidate_draft_host_pinned_delta" in compact
 
     def test_load_model_drops_cpu_offloaded_drafter_from_budget(self):
         # A SEPARATE drafter offloaded to CPU (--spec-draft-ngl 0 /

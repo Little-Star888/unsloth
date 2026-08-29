@@ -783,6 +783,35 @@ def test_the_cpu_fallback_keeps_a_load_mode_the_user_asked_for(monkeypatch):
     assert out[-2:] == ["--load-mode", "none"]
 
 
+def test_an_unsized_cpu_drafter_forces_the_fallback_to_pageable_loading():
+    """Unknown companion bytes cannot prove an unmapped CPU replay fits."""
+    from unittest import mock
+
+    from core.inference import llama_cpp as lc
+
+    backend = LlamaCppBackend.__new__(LlamaCppBackend)
+    backend._fit_load_mode_flags = []
+    replay = ["llama-server", "-m", "model.gguf", "--load-mode", "none"]
+    with (
+        mock.patch.object(lc.LlamaCppBackend, "_is_vulkan_backend", return_value = True),
+        mock.patch.object(lc.LlamaCppBackend, "_cpu_isolated_replay", return_value = list(replay)),
+        mock.patch.object(lc.LlamaCppBackend, "_cpu_isolated_binary", return_value = "cpu-server"),
+        mock.patch.object(
+            lc.LlamaCppBackend,
+            "_llama_server_env_for_binary",
+            return_value = {lc._loader_path_var(): "/staged"},
+        ),
+        mock.patch.object(lc.LlamaCppBackend, "_launch_host_shortfall_message", return_value = None),
+    ):
+        out, _reason, note = backend._prepare_cpu_fallback_launch(
+            "llama-server", replay, {}, {}, additional_host_only_bytes = None
+        )
+
+    assert "--load-mode" not in out
+    assert "--no-mmap" not in out
+    assert note
+
+
 def test_only_the_recorded_subsequence_is_removed():
     """A user's own --load-mode after ours must survive the strip."""
     from core.inference.llama_cpp import _without_subsequence
@@ -1651,7 +1680,8 @@ def test_a_partial_draft_offload_leaves_the_drafter_unsized():
 
     compact = "".join(inspect.getsource(B.load_model).split())
     assert (
-        "_draft_split_across_host=bool(_mtp_draft_for_budgetand_draft_is_split_across_host("
+        "_draft_split_across_host=bool(_mtp_will_engageand_mtp_draft_for_budget"
+        "and_draft_is_split_across_host("
         in compact
     )
     # The same effective views the other overrides are classified on.

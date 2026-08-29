@@ -211,6 +211,25 @@ def test_explicit_context_auto_retries_a_discrete_subset_with_the_host_discount(
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
 
 
+def test_an_unclassified_cuda_device_keeps_vram_without_receiving_the_discount(tmp_path):
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 12_000, 16_000)],
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: False
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 100
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    captured = {}
+    backend._fit_derived_load_mode = lambda **kwargs: captured.update(kwargs) or None
+
+    _launch(backend, gguf)
+
+    assert captured["shared_gpu_ids"] == set()
+    assert captured["model_size"] == 1024
+
+
 def test_auto_context_tries_a_discrete_singleton_before_a_mixed_prefix(tmp_path):
     """A shared GPU can rank first even though only the discrete sibling fits
     after host-pinned weights are removed from its VRAM budget."""
