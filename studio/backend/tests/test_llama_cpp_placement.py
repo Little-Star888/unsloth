@@ -2402,9 +2402,7 @@ def test_host_pinned_weights_keep_an_unmapped_load_from_spending_surplus_vram(
     assert "memory mapping instead" in (backend.last_load_warning or "")
 
 
-def test_a_mixed_vulkan_pin_preserves_the_physical_host_embedding_floor(
-    tmp_path, monkeypatch
-):
+def test_a_mixed_vulkan_pin_preserves_the_physical_host_embedding_floor(tmp_path, monkeypatch):
     """A trailing mixed-device override cancels the discrete-only VRAM discount,
     but surplus dGPU memory still cannot hold embeddings pinned in system RAM."""
     gib = 1024**3
