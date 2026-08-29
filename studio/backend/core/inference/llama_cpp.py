@@ -19379,9 +19379,7 @@ class LlamaCppBackend:
                         _tp_model_size = max(
                             0,
                             model_size
-                            - _candidate_host_pinned_delta(
-                                [idx for idx, _free in tp_gpus]
-                            ),
+                            - _candidate_host_pinned_delta([idx for idx, _free in tp_gpus]),
                         )
                         # Pooled usable budget (after each device's compute buffer)
                         # must hold the non-shrinkable footprint: weights + the MTP
