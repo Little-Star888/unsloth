@@ -7988,7 +7988,12 @@ class LlamaCppBackend:
                     continue
                 props = torch.cuda.get_device_properties(ordinal)
                 if is_rocm:
-                    rocm_classifier(props)
+                    _arch, is_unified = rocm_classifier(props)
+                    if not is_unified:
+                        # ROCm exposes no reliable negative signal: older wheels
+                        # omit or zero is_integrated even for Phoenix gfx1103 APUs.
+                        # A positive classification is useful; False is unknown.
+                        return False
                 elif not (hasattr(props, "is_integrated") or hasattr(props, "integrated")):
                     return False
                 seen.add(pid)
@@ -19488,6 +19493,28 @@ class LlamaCppBackend:
                                 min_gpus = _layer_min_gpus,
                                 split_extra_bytes = _cc_split_extra(effective_ctx),
                             )
+                            if use_fit and not gpu_ids and _host_pinned_candidate > _host_pinned:
+                                _discrete_gpus = [
+                                    gpu for gpu in gpus if gpu[0] not in _shared_gpu_ids
+                                ]
+                                if _discrete_gpus:
+                                    _candidate_total = requested_total - (
+                                        _host_pinned_candidate - _host_pinned
+                                    )
+                                    _candidate_indices, _candidate_fit = (
+                                        self._select_gpus_split_aware(
+                                            _candidate_total,
+                                            _discrete_gpus,
+                                            usable_fraction = _pin_fraction,
+                                            total_by_idx = total_by_idx,
+                                            per_device_overhead_bytes = _pipeline_overhead_bytes
+                                            + _cc_bytes(effective_ctx),
+                                            min_gpus = _layer_min_gpus,
+                                            split_extra_bytes = _cc_split_extra(effective_ctx),
+                                        )
+                                    )
+                                    if not _candidate_fit:
+                                        gpu_indices, use_fit = _candidate_indices, False
                             # No silent shrink: effective_ctx stays == requested_ctx.
                         else:
                             # Auto context: prefer fewer GPUs, cap to fit. Same
@@ -19627,6 +19654,19 @@ class LlamaCppBackend:
                             per_device_overhead_bytes = _pipeline_overhead_bytes,
                             min_gpus = _layer_min_gpus,
                         )
+                        if use_fit and not gpu_ids and _host_pinned_candidate > _host_pinned:
+                            _discrete_gpus = [gpu for gpu in gpus if gpu[0] not in _shared_gpu_ids]
+                            if _discrete_gpus:
+                                _candidate_indices, _candidate_fit = self._select_gpus(
+                                    _fs_total - (_host_pinned_candidate - _host_pinned),
+                                    _discrete_gpus,
+                                    usable_fraction = _pin_fraction,
+                                    total_by_idx = total_by_idx,
+                                    per_device_overhead_bytes = _pipeline_overhead_bytes,
+                                    min_gpus = _layer_min_gpus,
+                                )
+                                if not _candidate_fit:
+                                    gpu_indices, use_fit = _candidate_indices, False
                         if use_fit and not explicit_ctx:
                             # Without KV metadata, llama.cpp owns the fit. Keep the
                             # same useful Auto default as the measured offload path.

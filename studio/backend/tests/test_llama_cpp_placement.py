@@ -152,6 +152,65 @@ def _launch_warns(backend, gguf, **load_kwargs):
     return captured
 
 
+def test_file_size_auto_retries_a_discrete_subset_with_the_host_discount(tmp_path):
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 12_000, 16_000), (1, 1_000, 0)],
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 100
+    calls = []
+
+    def select(size, gpus, **_kwargs):
+        calls.append((size, list(gpus)))
+        if len(calls) == 1:
+            return None, True
+        return ([0], False) if [gpu[0] for gpu in gpus] == [0] else (None, True)
+
+    backend._select_gpus = select
+    result = _launch(backend, gguf)
+
+    assert len(calls) == 2
+    assert [gpu[0] for gpu in calls[0][1]] == [0, 1]
+    assert [gpu[0] for gpu in calls[1][1]] == [0]
+    assert calls[1][0] == calls[0][0] - 100
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_explicit_context_auto_retries_a_discrete_subset_with_the_host_discount(tmp_path):
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 12_000, 16_000), (1, 1_000, 0)],
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 100
+    backend._can_estimate_kv = lambda: True
+    backend._estimate_kv_cache_bytes = lambda *_a, **_kw: 0
+    backend._compute_buffer_ctx_bytes = lambda *_a, **_kw: 0
+    backend._estimate_compute_buffer_bytes = lambda **_kw: 1
+    backend._fit_context_to_vram = lambda requested, *_a, **_kw: requested
+    calls = []
+
+    def select(size, gpus, **_kwargs):
+        calls.append((size, list(gpus)))
+        if len(calls) == 1:
+            return None, True
+        return ([0], False) if [gpu[0] for gpu in gpus] == [0] else (None, True)
+
+    backend._select_gpus_split_aware = select
+    result = _launch(backend, gguf, n_ctx = 4096)
+
+    assert len(calls) == 2
+    assert [gpu[0] for gpu in calls[0][1]] == [0, 1]
+    assert [gpu[0] for gpu in calls[1][1]] == [0]
+    assert calls[1][0] == calls[0][0] - 100
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+
+
 def test_vulkan_selection_uses_ordinals_and_owns_device_flags(tmp_path):
     backend, gguf = _backend(
         tmp_path,
