@@ -244,13 +244,15 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
     )
 
     src = inspect.getsource(backend)
-    assert (
-        "+ self._tied_output_bytes(model_path)" in src
-    ), "the context budget no longer charges the tied-embedding duplicate"
-    assert "- _host_pinned," in src, "the context budget no longer discounts host-pinned embeddings"
+    assert "+ self._tied_output_bytes(model_path)" in src, (
+        "the context budget no longer charges the tied-embedding duplicate"
+    )
+    assert "- _host_pinned" in src, "the context budget no longer discounts host-pinned embeddings"
     assert "_host_pinned_vram_discount(" in src
     assert "env = os.environ" in src
-    assert "shared_memory = _shared_memory" in src
+    assert "shared_memory = False" in src
+    assert "_host_pinned = 0 if _shared_memory else _host_pinned_candidate" in src
+    assert "not (set(gpu_indices) & _shared_gpu_ids)" in src
 
 
 def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monkeypatch):
@@ -274,6 +276,73 @@ def test_vulkan_igpu_is_shared_memory_and_unknown_is_conservative(backend, monke
     assert backend._vulkan_targets_are_igpus("server", conservative_on_unknown = True) is True
 
 
+def test_one_vulkan_snapshot_drives_memory_and_shared_classification(backend, monkeypatch):
+    rows = [
+        {"index": 0, "free_mib": 8192, "total_mib": 16384, "is_igpu": False},
+        {"index": 1, "free_mib": 4096, "total_mib": 8192, "is_igpu": True},
+    ]
+    monkeypatch.setattr(
+        backend,
+        "_run_vulkan_probe",
+        staticmethod(lambda *_a, **_kw: pytest.fail("snapshot was probed twice")),
+    )
+    assert backend._vulkan_rows_target_igpus(rows, [0]) is False
+    assert backend._vulkan_rows_target_igpus(rows, [1]) is True
+    memory = backend._get_gpu_free_memory_vulkan("server", rows = rows)
+    assert memory[0] == (0, 8192, 16384)
+    assert memory[1][0] == 1
+    assert memory[1][2] == 0
+
+
+def test_unreadable_cuda_properties_are_not_proved_discrete(backend, monkeypatch):
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def get_device_properties(_ordinal):
+            raise OSError("property probe failed")
+
+    class _Version:
+        hip = None
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is False
+
+
+def test_a_classified_discrete_cuda_device_is_known(backend, monkeypatch):
+    class _Props:
+        is_integrated = False
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = None
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is True
+
+
 def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
     """An explicit device override outranks llama.cpp's host fallback."""
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"], env = {}) is True
@@ -289,6 +358,11 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
         )
         is True
     )
+    assert (
+        backend._override_moves_host_pinned(["--override-tensor=token_embd.weight=CUDA0"], env = {})
+        is True
+    )
+    assert backend._override_moves_host_pinned(["-ot=token_embd.weight=CUDA0"], env = {}) is True
     assert backend._override_moves_host_pinned(["-ot", r".*embd.*=CUDA0"], env = {}) is True
     assert backend._override_moves_host_pinned(["-ot", "token_embd=CUDA0"], env = {}) is True
     assert backend._override_moves_host_pinned(["-ot", "embd=CUDA0"], env = {}) is True
@@ -318,6 +392,10 @@ def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
 def test_cpu_only_or_absent_overrides_keep_the_discount(backend):
     # Sending them to CPU is where llama.cpp puts them anyway.
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CPU"], env = {}) is False
+    assert (
+        backend._override_moves_host_pinned(["--override_tensor=token_embd.weight=CPU"], env = {})
+        is False
+    )
     # Our own planner's patterns move FFN tensors, never the embeddings.
     assert (
         backend._override_moves_host_pinned(["-ot", r"^blk\.(1|2)\.ffn_down\.weight$=CPU"], env = {})

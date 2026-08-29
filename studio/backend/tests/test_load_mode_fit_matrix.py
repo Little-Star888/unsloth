@@ -319,7 +319,7 @@ def test_the_launch_charges_the_cpu_pinned_drafter_to_the_fit():
     )
     # ... and charged to the footprint as a HOST-ONLY term (free VRAM cannot pay for
     # an allocation the child only ever makes in RAM), abstaining when unpriceable.
-    assert "host_only_bytes=_cpu_draft_fit_bytesor0" in compact
+    assert "host_only_bytes=(_cpu_draft_fit_bytesor0)+_host_pinned" in compact
     assert "or_cpu_draft_fit_bytesisNone" in compact
 
 
@@ -337,8 +337,7 @@ def test_a_weights_only_drafter_reserve_counts_as_unsized():
 
     compact = "".join(inspect.getsource(B.load_model).split())
     assert (
-        "mtp_unsized=bool(_flat_mtp_engagesor_cpu_draft_fit_bytesisNone"
-        "or_draft_split_across_host)"
+        "mtp_unsized=bool(_flat_mtp_engagesor_cpu_draft_fit_bytesisNoneor_draft_split_across_host)"
     ) in compact
     assert "_flat_mtp_engagesandmtp_overhead_fnisNone" not in compact
 
