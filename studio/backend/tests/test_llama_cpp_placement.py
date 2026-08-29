@@ -3131,6 +3131,70 @@ def test_tensor_planning_prices_a_discrete_subset_with_the_host_discount(tmp_pat
     assert cmd[cmd.index("--split-mode") + 1] == "tensor"
 
 
+def test_tensor_planning_keeps_a_large_drafter_discount_in_the_mtp_reserve(tmp_path):
+    """A drafter discount larger than the target must not disappear into the
+    target's zero clamp. Tensor planning prices each discount against its owner."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 1_000, 0), (1, 24_000, 24_000), (2, 24_000, 24_000)],
+    )
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"draft")
+    backend._read_gguf_metadata = lambda _path: setattr(backend, "_context_length", 8_192)
+    backend._get_gguf_size_bytes = lambda path: 8 * gib if Path(path) == draft else 3 * gib
+    backend._tied_output_bytes = lambda path: 4 * gib if Path(path) == draft else 0
+    backend._host_pinned_vram_discount = (
+        lambda *_a, draft_model = False, **_kw: 4 * gib if draft_model else 0
+    )
+    backend._amd_apu_wants_unified_memory = lambda ids = None: ids is None or ids == [0]
+    backend._integrated_cuda_unified_memory = lambda _ids = None: False
+    backend._torch_unified_memory_classification_known = lambda _ids = None: True
+    backend._can_estimate_kv = lambda: True
+    backend._estimate_kv_cache_bytes = lambda *_a, **_kw: 0
+    backend._compute_buffer_ctx_bytes = lambda *_a, **_kw: 0
+    backend._estimate_compute_buffer_bytes = lambda **_kw: 2 * gib
+    backend._estimate_mtp_overhead_bytes = (
+        lambda _ctx, draft_weights_bytes = 0, **_kw: draft_weights_bytes + gib
+    )
+    backend._draft_backend_for = lambda _path: types.SimpleNamespace(
+        _n_layers = 32,
+        _architecture = "gemma3",
+        _can_estimate_kv = lambda: True,
+        _estimate_kv_cache_bytes = lambda *_a, **_kw: 1,
+    )
+    backend._tensor_split_aborts = lambda *_a, **_kw: False
+    backend._tensor_quant_kv_unsupported_binary = lambda *_a, **_kw: False
+    backend.probe_server_capabilities = lambda _binary: {
+        "found": True,
+        "mtp_token": "draft-mtp",
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+        "supports_kv_unified": True,
+    }
+    planned = {}
+    real_plan = backend._plan_tensor_parallel
+
+    def plan(gpus, model_size, *args, **kwargs):
+        planned["model_size"] = model_size
+        planned["mtp_at_floor"] = kwargs["mtp_overhead_fn"](2_048)
+        return real_plan(gpus, model_size, *args, **kwargs)
+
+    backend._plan_tensor_parallel = plan
+
+    cmd = _launch(
+        backend,
+        gguf,
+        tensor_parallel = True,
+        n_ctx = 8_192,
+        speculative_type = "auto",
+        mtp_draft_path = str(draft),
+    )["cmd"]
+
+    assert planned == {"model_size": 3 * gib, "mtp_at_floor": 9 * gib}
+    assert cmd[cmd.index("--split-mode") + 1] == "tensor"
+
+
 def test_tensor_mode_keeps_an_inherited_quantized_kv_env(tmp_path, monkeypatch):
     """The tensor-branch env scrub owns the split, not the cache type: an
     LLAMA_ARG_CACHE_TYPE_K/_V reaches the child untouched, while the tensor split

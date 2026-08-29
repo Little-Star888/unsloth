@@ -19602,10 +19602,23 @@ class LlamaCppBackend:
                     _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
 
                     if tensor_parallel and tp_gpus:
+                        _tp_candidate_ids = [idx for idx, _free in tp_gpus]
+                        _tp_target_discount = _candidate_target_host_pinned_delta(
+                            _tp_candidate_ids
+                        )
+                        _tp_draft_discount = _candidate_draft_host_pinned_delta(
+                            _tp_candidate_ids
+                        )
                         _tp_model_size = max(
                             0,
-                            model_size
-                            - _candidate_host_pinned_delta([idx for idx, _free in tp_gpus]),
+                            model_size - _tp_target_discount,
+                        )
+
+                        def _tp_mtp_bytes(ctx: int) -> int:
+                            return max(0, _mtp_bytes(ctx) - _tp_draft_discount)
+
+                        _tp_mtp_overhead_fn = (
+                            _tp_mtp_bytes if mtp_overhead_fn is not None else None
                         )
                         # Pooled usable budget (after each device's compute buffer)
                         # must hold the non-shrinkable footprint: weights + the MTP
@@ -19619,7 +19632,7 @@ class LlamaCppBackend:
                             # target keeps no state of its own (no GPU bytes at all).
                             _tp_mtp_floor = 0
                         elif mtp_overhead_fn is not None and not _mtp_kv_unsized:
-                            _tp_mtp_floor = _mtp_bytes(
+                            _tp_mtp_floor = _tp_mtp_bytes(
                                 min(2048, effective_ctx) if effective_ctx > 0 else 2048
                             )
                         else:
@@ -19628,7 +19641,9 @@ class LlamaCppBackend:
                             # cushion, never below the known byte reserve.
                             _tp_mtp_floor = max(
                                 _tp_flat_mtp,
-                                _mtp_bytes(min(2048, effective_ctx) if effective_ctx > 0 else 2048),
+                                _tp_mtp_bytes(
+                                    min(2048, effective_ctx) if effective_ctx > 0 else 2048
+                                ),
                             )
                         _tp_required_mib = (_tp_model_size + _tp_mtp_floor + _soft_overhead) / (
                             1024 * 1024
@@ -19701,7 +19716,7 @@ class LlamaCppBackend:
                             scratch_cache_type_kv = _scratch_cache_type_kv,
                             n_parallel = n_parallel,
                             mtp_engaged = _mtp_reserves_gpu,
-                            mtp_overhead_fn = mtp_overhead_fn,
+                            mtp_overhead_fn = _tp_mtp_overhead_fn,
                             mtp_flat_reserve_bytes = _tp_unsized_mtp_reserve,
                             # Report the UI ceiling from native ctx, not the
                             # explicit small request.
