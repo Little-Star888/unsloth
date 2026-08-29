@@ -18171,6 +18171,19 @@ class LlamaCppBackend:
                             or self._integrated_cuda_unified_memory([idx])
                             or not self._torch_unified_memory_classification_known([idx])
                         }
+
+                    def _candidate_host_pinned_delta(candidate_ids) -> int:
+                        """Discount host-pinned weights only for an automatic
+                        placement whose complete candidate set is discrete."""
+                        if (
+                            gpu_ids
+                            or not candidate_ids
+                            or _host_pinned_candidate <= _host_pinned
+                            or (set(candidate_ids) & _shared_gpu_ids)
+                        ):
+                            return 0
+                        return _host_pinned_candidate - _host_pinned
+
                     # The --fit fallback is llama.cpp's own fitter, which knows nothing
                     # about this budget: it keeps its own margin and packs the rest on,
                     # so the slider never reached the path that runs when the fit is
@@ -18838,7 +18851,9 @@ class LlamaCppBackend:
                         )
 
                     _mm_budgeted_gpus = [
-                        (_idx, _free) for _idx, _free in gpus if total_by_idx.get(_idx, 0) > 0
+                        (_idx, _free)
+                        for _idx, _free in gpus
+                        if total_by_idx.get(_idx, 0) > 0
                     ]
                     _discrete_vram = bool(_mm_budgeted_gpus)
                     if (
@@ -18902,6 +18917,9 @@ class LlamaCppBackend:
                         )
                         _mm_need = (
                             _model_weight_vram_bytes
+                            - _candidate_host_pinned_delta(
+                                [_idx for _idx, _free in _mm_budgeted_gpus]
+                            )
                             + mmproj_size
                             + _compute_buffer_pipeline
                             + self._CUDA_CONTEXT_RESERVE_BYTES
@@ -19012,7 +19030,7 @@ class LlamaCppBackend:
                                 else 0.0
                             )
 
-                        def _probe_base(drafter: bool, n: int) -> int:
+                        def _probe_base(drafter: bool, n: int, subset = None) -> int:
                             # model_size_fit's terms, before it is built below.
                             _soft = self._CUDA_CONTEXT_RESERVE_BYTES
                             if effective_is_vision and mmproj_size > 0:
@@ -19021,6 +19039,9 @@ class LlamaCppBackend:
                                 _soft += self._MTP_DRAFT_COMPUTE_BYTES
                             return (
                                 model_size
+                                - _candidate_host_pinned_delta(
+                                    [_idx for _idx, _free in (subset or ())]
+                                )
                                 + _compute_buffer_pipeline
                                 + _soft
                                 + max(0, n - 1) * _pipeline_overhead_bytes
@@ -19078,7 +19099,7 @@ class LlamaCppBackend:
                             for _n in range(_probe_min_gpus, len(_probe_ranked) + 1):
                                 _subset = _probe_ranked[:_n]
                                 _cc_n = lambda c, _k = _n: _cc_bytes(c, _k)
-                                _base_wo = _probe_base(False, _n)
+                                _base_wo = _probe_base(False, _n, _subset)
                                 _budget_wo = _pool_budget_mib(_subset, _probe_frac(False))
                                 # Explicit context is honored verbatim, so that is what the
                                 # drafter has to fit alongside; Auto gets its own best cap.
@@ -19144,7 +19165,9 @@ class LlamaCppBackend:
                                     if _foot_wo > _budget_wo:
                                         continue
                                 _foot_w = (
-                                    _probe_base(True, _n) + _shared + _mtp_bytes(_ctx_wo)
+                                    _probe_base(True, _n, _subset)
+                                    + _shared
+                                    + _mtp_bytes(_ctx_wo)
                                 ) / (1024 * 1024)
                                 _budget_w = _pool_budget_mib(_subset, _probe_frac(True))
                                 if not _target_fits_somewhere:
@@ -19169,7 +19192,7 @@ class LlamaCppBackend:
                                     else self._fit_context_to_vram(
                                         _ctx_wo,
                                         _budget_w,
-                                        _probe_base(True, _n),
+                                        _probe_base(True, _n, _subset),
                                         cache_type_kv,
                                         swa_full = swa_full,
                                         n_parallel = n_parallel,
@@ -19188,7 +19211,7 @@ class LlamaCppBackend:
                                 if (
                                     _ctx_w > 0
                                     and (
-                                        _probe_base(True, _n)
+                                        _probe_base(True, _n, _subset)
                                         + _kv_bytes(_ctx_w)
                                         + _cc_n(_ctx_w)
                                         + _mtp_bytes(_ctx_w)
@@ -19282,13 +19305,10 @@ class LlamaCppBackend:
 
                     def _subset_model_size(n_gpus: int, subset = None) -> int:
                         size = model_size_fit + max(0, n_gpus - 1) * _pipeline_overhead_bytes
-                        if (
-                            not gpu_ids
-                            and subset
-                            and _host_pinned_candidate > _host_pinned
-                            and not ({idx for idx, _free in subset} & _shared_gpu_ids)
-                        ):
-                            size -= _host_pinned_candidate - _host_pinned
+                        if subset:
+                            size -= _candidate_host_pinned_delta(
+                                [idx for idx, _free in subset]
+                            )
                         return size
 
                     # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
@@ -19498,8 +19518,8 @@ class LlamaCppBackend:
                                     gpu for gpu in gpus if gpu[0] not in _shared_gpu_ids
                                 ]
                                 if _discrete_gpus:
-                                    _candidate_total = requested_total - (
-                                        _host_pinned_candidate - _host_pinned
+                                    _candidate_total = requested_total - _candidate_host_pinned_delta(
+                                        [idx for idx, _free in _discrete_gpus]
                                     )
                                     _candidate_indices, _candidate_fit = (
                                         self._select_gpus_split_aware(
@@ -19658,7 +19678,10 @@ class LlamaCppBackend:
                             _discrete_gpus = [gpu for gpu in gpus if gpu[0] not in _shared_gpu_ids]
                             if _discrete_gpus:
                                 _candidate_indices, _candidate_fit = self._select_gpus(
-                                    _fs_total - (_host_pinned_candidate - _host_pinned),
+                                    _fs_total
+                                    - _candidate_host_pinned_delta(
+                                        [idx for idx, _free in _discrete_gpus]
+                                    ),
                                     _discrete_gpus,
                                     usable_fraction = _pin_fraction,
                                     total_by_idx = total_by_idx,
@@ -19887,7 +19910,7 @@ class LlamaCppBackend:
                         and _host_pinned_candidate > _host_pinned
                         and not (set(gpu_indices) & _shared_gpu_ids)
                     ):
-                        _new_discount = _host_pinned_candidate - _host_pinned
+                        _new_discount = _candidate_host_pinned_delta(gpu_indices)
                         _host_pinned = _host_pinned_candidate
                         _model_weight_vram_bytes = max(0, _model_weight_vram_bytes - _new_discount)
                         model_size = max(0, model_size - _new_discount)
@@ -22844,7 +22867,7 @@ class LlamaCppBackend:
                         if model_size is not None and _retry_wants_unified:
                             _apu_avail_mib = self._available_system_memory_mib()
                             _retry_apu_msg = self._apu_ram_shortfall_message(
-                                model_size + _mmproj_pinned_bytes,
+                                model_size + _host_pinned + _mmproj_pinned_bytes,
                                 _apu_avail_mib,
                             )
                             # Same contract as the preflight above: the opt-out takes

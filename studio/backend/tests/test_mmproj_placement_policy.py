@@ -239,6 +239,68 @@ def test_shared_memory_pools_are_not_charged_as_discrete(tmp_path, memory, label
     assert "--no-mmproj-offload" not in cmd, label
 
 
+def test_discrete_projector_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_path):
+    """A shared device makes the initial model footprint conservative, but the
+    projector probe itself evaluates only the discrete card. Host-pinned
+    embeddings must be removed from that candidate's footprint or Auto sends a
+    projector to the CPU even though the selected card holds the complete load."""
+    backend, gguf = _backend(
+        tmp_path,
+        memory = [(0, 8_692, 16_384), (1, 1_000, 0)],
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 512 * MIB
+
+    result = _launch(backend, gguf)
+
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+    assert "--no-mmproj-offload" not in result["cmd"]
+
+
+def test_discrete_mtp_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_path):
+    """The MTP-retention probe walks candidate subsets too. A discrete-only
+    candidate must receive the same host-pinned discount during its reduced-
+    context fallback before Auto decides whether to widen the candidate set."""
+    backend, gguf = _backend(
+        tmp_path,
+        memory = [(0, 9_500, 16_384), (1, 1_000, 0)],
+        drafter_bytes = 2 * GIB,
+        native_ctx = 16_384,
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 3 * GIB
+    real_fit = backend._fit_context_to_vram
+    mtp_fallbacks = []
+
+    def record_fit(*args, **kwargs):
+        fitted = real_fit(*args, **kwargs)
+        if kwargs.get("mtp_engaged") and kwargs.get("pooled"):
+            mtp_fallbacks.append((args[0], args[2], fitted))
+        return fitted
+
+    backend._fit_context_to_vram = record_fit
+
+    result = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(tmp_path / "mtp.gguf"),
+        speculative_type = "auto",
+    )
+
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+    assert len(mtp_fallbacks) == 1
+    requested_ctx, model_base, fitted_ctx = mtp_fallbacks[0]
+    assert requested_ctx == 16_384
+    assert fitted_ctx < requested_ctx
+    # Without the 3 GiB candidate discount this fallback base is over 8 GiB.
+    assert model_base < 8 * GIB
+    # Auto preserves the target context and drops the optional speed feature.
+    assert "--model-draft" not in result["cmd"]
+    assert int(result["cmd"][result["cmd"].index("-c") + 1]) == requested_ctx
+
+
 # The drafter tests share one shape: a small native context so the drop probe
 # prices the reserve near the floor, and a 2 GiB drafter. Only the budget moves.
 DRAFTER_NATIVE_CTX = 8192

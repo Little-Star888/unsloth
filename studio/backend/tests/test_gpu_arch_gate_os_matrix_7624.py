@@ -2169,6 +2169,37 @@ class TestArchCrashRetryRechecksTheApuRamGuard:
         # capture["error"] is now the simulated HIP crash, not the RAM guard, so
         # asserting the guard's text there would only re-test the mock.
 
+    def test_retry_onto_an_apu_restores_the_discrete_host_pinned_discount(
+        self, tmp_path, monkeypatch, probe_env
+    ):
+        """The first placement is discrete-only, so its host-pinned embeddings do
+        not consume VRAM. The kernel-image retry moves to an APU where those bytes
+        return to the shared system-RAM pool and must be charged again."""
+        torch = self._dgpu_then_apu(monkeypatch)
+        backend = LlamaCppBackend()
+        backend._host_pinned_vram_discount = lambda *_a, **_kw: 4 * 1024**3
+        calls: list = []
+
+        def _shortfall(model_size_bytes, avail_mib, *_a, **_kw):
+            calls.append((model_size_bytes, avail_mib))
+            return "This model needs about 20 GB but only about 8 GB is available."
+
+        launches = _run_auto_load(
+            monkeypatch,
+            tmp_path,
+            torch,
+            None,
+            returncode = 1,
+            output = "ROCm error: device kernel image is invalid",
+            model_bytes = 20 * 1024**3,
+            apu_ram_stub = _shortfall,
+            backend = backend,
+        )
+
+        assert launches, "the first spawn never ran"
+        assert len(calls) == 1
+        assert calls[0][0] == 20 * 1024**3
+
     def test_a_model_that_fits_still_retries_onto_the_apu(self, tmp_path, monkeypatch, probe_env):
         """The guard warns on a shortfall, it does not block the fallback. With
         room to spare the retry runs exactly as before."""
