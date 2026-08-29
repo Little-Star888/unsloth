@@ -7296,6 +7296,79 @@ class LlamaCppBackend:
             return 0
 
     @staticmethod
+    def _host_pinned_weight_items(model_path: str) -> "tuple[tuple[str, int], ...]":
+        """Concrete host-pinned tensor names and bytes, or empty when unreadable."""
+        try:
+            paths = LlamaCppBackend._gguf_shard_paths(model_path)
+            stats = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+        except OSError:
+            return ()
+        return LlamaCppBackend._host_pinned_weight_items_cached(stats)
+
+    @staticmethod
+    @functools.lru_cache(maxsize = 64)
+    def _host_pinned_weight_items_cached(stats: tuple) -> "tuple[tuple[str, int], ...]":
+        try:
+            from gguf import GGUFReader
+
+            items = []
+            for path, _size, _mtime in stats:
+                for tensor in GGUFReader(path).tensors:
+                    name = str(tensor.name)
+                    if name == "token_embd.weight" or name.startswith(
+                        "per_layer_token_embd"
+                    ):
+                        items.append((name, int(tensor.n_bytes)))
+            return tuple(items)
+        except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
+            logger.debug(
+                "host-pinned item probe failed for %s (%s)",
+                stats and stats[0][0],
+                exc,
+            )
+            return ()
+
+    @staticmethod
+    def _tensor_override_mappings(
+        extra_args: Optional[Iterable[str]],
+        env: Optional[Mapping[str, str]] = None,
+        *,
+        draft_model: bool = False,
+    ) -> "tuple[tuple[str, str], ...]":
+        """Parsed pattern/buffer mappings for the target or separate drafter."""
+        argv = [str(a) for a in extra_args or ()]
+        values: list[str] = []
+        flags = (
+            ("-otd", "--override-tensor-draft", "--spec-draft-override-tensor")
+            if draft_model
+            else ("-ot", "--override-tensor")
+        )
+        for i, tok in enumerate(argv):
+            # llama.cpp folds underscores in option names and accepts both
+            # ``--flag value`` and ``--flag=value``.
+            base, _, inline = tok.partition("=")
+            if _flag_name(base) in flags:
+                value = inline if inline else (argv[i + 1] if i + 1 < len(argv) else "")
+                if value:
+                    values.append(value)
+        inherited = (
+            None
+            if draft_model
+            else (os.environ if env is None else env).get("LLAMA_ARG_OVERRIDE_TENSOR")
+        )
+        if inherited:
+            values.append(str(inherited))
+        mappings = []
+        for spec in values:
+            for mapping in spec.split(","):
+                # llama.cpp splits each `pattern=buft` entry on the last '='.
+                pattern, sep, buft = mapping.rpartition("=")
+                if not sep or not pattern:
+                    continue
+                mappings.append((pattern, buft.strip()))
+        return tuple(mappings)
+
+    @staticmethod
     def _override_moves_host_pinned(
         extra_args: Optional[Iterable[str]],
         env: Optional[Mapping[str, str]] = None,
@@ -7340,6 +7413,41 @@ class LlamaCppBackend:
                     continue
                 return True
         return False
+
+    def _host_pinned_floor_bytes(
+        self,
+        model_path: str,
+        extra_args: Optional[Iterable[str]],
+        *,
+        env: Optional[Mapping[str, str]] = None,
+        draft_model: bool = False,
+    ) -> int:
+        """Host bytes left after only provable exact-name GPU overrides.
+
+        Arbitrary regexes are not interpreted here: Python and llama.cpp regex
+        semantics need not agree, and a CPU rule could restore a tensor later.
+        Either uncertainty charges the raw floor. Exact names with only non-CPU
+        mappings are concrete and can be subtracted from enumerated tensors.
+        """
+        items = self._host_pinned_weight_items(model_path)
+        raw = (
+            sum(size for _name, size in items)
+            if items
+            else self._host_pinned_weight_bytes(model_path)
+        )
+        mappings = self._tensor_override_mappings(
+            extra_args,
+            env,
+            draft_model = draft_model,
+        )
+        if not mappings or any(buft.upper() == "CPU" for _pattern, buft in mappings):
+            return raw
+        if not items:
+            return raw
+        exact_gpu_names = {
+            pattern for pattern, buft in mappings if buft.upper() != "CPU"
+        }
+        return sum(size for name, size in items if name not in exact_gpu_names)
 
     @staticmethod
     def _host_pinned_vram_discount(
@@ -18180,7 +18288,20 @@ class LlamaCppBackend:
                         env = os.environ,
                         shared_memory = False,
                     )
-                    _host_pinned_floor = _host_pinned_candidate
+                    # Discount eligibility and physical host residency answer
+                    # opposite questions under an arbitrary tensor override.
+                    # Unknown non-CPU mappings must charge both pools: they may
+                    # move embeddings into VRAM, but are not proof that every
+                    # normally host-pinned embedding left RAM.
+                    _host_pinned_floor = (
+                        self._host_pinned_floor_bytes(
+                            model_path,
+                            extra_args,
+                            env = os.environ,
+                        )
+                        if self._override_moves_host_pinned(extra_args, os.environ)
+                        else _host_pinned_candidate
+                    )
                     _host_pinned = 0 if _shared_memory else _host_pinned_candidate
                     _model_weight_vram_bytes = max(
                         0, gguf_size + self._tied_output_bytes(model_path) - _host_pinned
@@ -18627,7 +18748,20 @@ class LlamaCppBackend:
                                 shared_memory = False,
                                 draft_model = True,
                             )
-                            _draft_host_pinned_floor = _draft_host_pinned_candidate
+                            _draft_host_pinned_floor = (
+                                self._host_pinned_floor_bytes(
+                                    _mtp_draft_for_budget,
+                                    extra_args,
+                                    env = os.environ,
+                                    draft_model = True,
+                                )
+                                if self._override_moves_host_pinned(
+                                    extra_args,
+                                    os.environ,
+                                    draft_model = True,
+                                )
+                                else _draft_host_pinned_candidate
+                            )
                             _draft_host_pinned = (
                                 0 if _shared_memory else _draft_host_pinned_candidate
                             )

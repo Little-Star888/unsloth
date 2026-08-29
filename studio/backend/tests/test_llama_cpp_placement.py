@@ -2457,6 +2457,168 @@ def test_host_pinned_weights_keep_an_unmapped_load_from_spending_surplus_vram(
     assert "memory mapping instead" in (backend.last_load_warning or "")
 
 
+def test_an_unrelated_tensor_override_cannot_erase_the_physical_host_floor(
+    tmp_path, monkeypatch
+):
+    """An arbitrary non-CPU tensor override makes the VRAM discount uncertain,
+    but it is not proof that normally host-pinned embeddings moved off RAM."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 24_000, 24_000)],
+    )
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 13 * gib
+    backend._host_pinned_weight_bytes = lambda _path: 8 * gib
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 4 * 1024)
+    )
+
+    cmd = _launch(
+        backend,
+        gguf,
+        extra_args = [
+            "--override-tensor",
+            r"^blk\.0=CUDA0",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert not _unmapped_tokens(cmd), cmd
+    assert "About 8 GB" in (backend.last_load_warning or "")
+
+
+def test_an_exact_embedding_override_removes_the_moved_target_host_floor(
+    tmp_path, monkeypatch
+):
+    """The conservative floor must not survive proof that the only host-pinned
+    target tensor is explicitly moved to a GPU buffer."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 24_000, 24_000)],
+    )
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 13 * gib
+    backend._host_pinned_weight_bytes = lambda _path: 8 * gib
+    backend._host_pinned_weight_items = lambda _path: (("token_embd.weight", 8 * gib),)
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 4 * 1024)
+    )
+
+    cmd = _launch(
+        backend,
+        gguf,
+        extra_args = [
+            "--override-tensor",
+            "token_embd.weight=CUDA0",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert _unmapped_tokens(cmd) == ["--no-mmap"], cmd
+    assert backend.last_load_warning is None
+
+
+def test_an_unrelated_draft_override_cannot_erase_the_drafter_host_floor(
+    tmp_path, monkeypatch
+):
+    """A separate GPU drafter owns its override and its physical embedding floor;
+    an uncertain draft regex must not delete those host-only bytes."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 24_000, 24_000)],
+    )
+    _restore_host_guard(backend)
+    draft = _write_gguf(tmp_path / "draft.gguf")
+    backend._get_gguf_size_bytes = lambda _path: 1 * gib
+    backend._host_pinned_weight_bytes = lambda path: 8 * gib if Path(path) == draft else 0
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    backend.probe_server_capabilities = lambda _binary = None: {
+        "mtp_token": "draft-mtp",
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+    }
+    backend._resolve_launch_mtp_path = lambda **_kwargs: str(draft)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 4 * 1024)
+    )
+
+    cmd = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(draft),
+        speculative_type = "mtp",
+        extra_args = [
+            "-otd",
+            r"^blk\.0=CUDA0",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert str(draft) in cmd
+    assert not _unmapped_tokens(cmd), cmd
+    assert "About 8 GB" in (backend.last_load_warning or "")
+
+
+def test_an_exact_draft_embedding_override_removes_the_moved_drafter_host_floor(
+    tmp_path, monkeypatch
+):
+    """An exact draft-side move owns only the enumerated drafter tensor and
+    should not force an otherwise fitting launch back to pageable loading."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 24_000, 24_000)],
+    )
+    _restore_host_guard(backend)
+    draft = _write_gguf(tmp_path / "draft-exact.gguf")
+    backend._get_gguf_size_bytes = lambda _path: 1 * gib
+    backend._host_pinned_weight_bytes = lambda path: 8 * gib if Path(path) == draft else 0
+    backend._host_pinned_weight_items = lambda path: (
+        (("token_embd.weight", 8 * gib),) if Path(path) == draft else ()
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    backend.probe_server_capabilities = lambda _binary = None: {
+        "mtp_token": "draft-mtp",
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+    }
+    backend._resolve_launch_mtp_path = lambda **_kwargs: str(draft)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 4 * 1024)
+    )
+
+    cmd = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(draft),
+        speculative_type = "mtp",
+        extra_args = [
+            "-otd",
+            "token_embd.weight=CUDA0",
+            "--no-mmap",
+        ],
+    )["cmd"]
+
+    assert str(draft) in cmd
+    assert _unmapped_tokens(cmd) == ["--no-mmap"], cmd
+    assert backend.last_load_warning is None
+
+
 def test_a_mixed_vulkan_pin_preserves_the_physical_host_embedding_floor(tmp_path, monkeypatch):
     """A trailing mixed-device override cancels the discrete-only VRAM discount,
     but surplus dGPU memory still cannot hold embeddings pinned in system RAM."""
