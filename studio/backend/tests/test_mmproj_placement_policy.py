@@ -258,10 +258,28 @@ def test_discrete_projector_probe_credits_host_pinned_embeddings_on_a_mixed_host
     assert "--no-mmproj-offload" not in result["cmd"]
 
 
+def test_projector_probe_tries_a_lower_ranked_discrete_singleton(tmp_path):
+    """The shared card ranks first but cannot hold the projector footprint. The
+    discrete sibling fits only after its host-pinned weight discount, while their
+    mixed pool still fails, so prefix-only probing would pin the projector needlessly."""
+    backend, gguf = _backend(
+        tmp_path,
+        memory = [(0, 3_200, 16_384), (1, 3_100, 16_384)],
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [1]
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 6 * GIB
+
+    result = _launch(backend, gguf)
+
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert "--no-mmproj-offload" not in result["cmd"]
+
+
 def test_discrete_mtp_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_path):
     """The MTP-retention probe walks candidate subsets too. A discrete-only
-    candidate must receive the same host-pinned discount during its reduced-
-    context fallback before Auto decides whether to widen the candidate set."""
+    candidate must receive the same host-pinned discount for both the target and
+    its drafter. When that exact subset holds both, Auto must retain the drafter."""
     backend, gguf = _backend(
         tmp_path,
         memory = [(0, 9_500, 16_384), (1, 1_000, 0)],
@@ -290,15 +308,42 @@ def test_discrete_mtp_probe_credits_host_pinned_embeddings_on_a_mixed_host(tmp_p
     )
 
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
-    assert len(mtp_fallbacks) == 1
-    requested_ctx, model_base, fitted_ctx = mtp_fallbacks[0]
-    assert requested_ctx == 16_384
-    assert fitted_ctx < requested_ctx
     # Without the 3 GiB candidate discount this fallback base is over 8 GiB.
-    assert model_base < 8 * GIB
-    # Auto preserves the target context and drops the optional speed feature.
+    discounted = [row for row in mtp_fallbacks if row[1] < 8 * GIB]
+    assert discounted
+    assert all(
+        requested == 16_384 and fitted == requested
+        for requested, _base, fitted in discounted
+    )
+    assert "--model-draft" in result["cmd"]
+    assert int(result["cmd"][result["cmd"].index("-c") + 1]) == 16_384
+
+
+def test_drafter_drop_probe_tries_a_lower_ranked_discrete_singleton(tmp_path):
+    """The target fits the lower-ranked discrete card only after its host-pinned
+    discount, but the drafter does not. Auto must see that valid target placement
+    and drop the optional drafter instead of shrinking context or spilling layers."""
+    backend, gguf = _backend(
+        tmp_path,
+        memory = [(0, 3_000, 16_384), (1, 2_900, 16_384)],
+        mmproj_bytes = 0,
+        drafter_bytes = 2 * GIB,
+        native_ctx = 8_192,
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: ids == [1]
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 5 * GIB
+
+    result = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(tmp_path / "mtp.gguf"),
+        speculative_type = "auto",
+    )
+
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     assert "--model-draft" not in result["cmd"]
-    assert int(result["cmd"][result["cmd"].index("-c") + 1]) == requested_ctx
+    assert backend.spec_fallback_reason == "drafter_no_vram"
 
 
 # The drafter tests share one shape: a small native context so the drop probe

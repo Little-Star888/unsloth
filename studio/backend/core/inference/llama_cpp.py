@@ -18890,6 +18890,29 @@ class LlamaCppBackend:
                         )
                         _mtp_kv_unsized = False
 
+                    def _ranked_candidate_subsets(ranked, min_count: int = 1):
+                        """Mixed-ranking prefixes plus the discrete-only alternatives.
+
+                        A shared GPU can rank first, making the ordinary prefixes the
+                        shared singleton and then the mixed pair. The discrete sibling
+                        may fit alone only after its host-pinned discount is applied, so
+                        try that same-cardinality alternative before adding a device.
+                        """
+                        discrete = [gpu for gpu in ranked if gpu[0] not in _shared_gpu_ids]
+                        subsets = []
+                        seen = set()
+                        for count in range(min_count, len(ranked) + 1):
+                            for source in (ranked, discrete):
+                                subset = source[:count]
+                                if len(subset) != count:
+                                    continue
+                                key = tuple(idx for idx, _free in subset)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                subsets.append(subset)
+                        return subsets
+
                     # Projector placement, the FIRST thing given up when the load does
                     # not fit: the encoder runs once per image, layers once per token,
                     # so host RAM is its better home when it is what costs residency.
@@ -19000,11 +19023,8 @@ class LlamaCppBackend:
                             if explicit_ctx
                             else min(self._MMPROJ_FIT_FLOOR_CTX, effective_ctx)
                         )
-                        _mm_need = (
+                        _mm_base_need = (
                             _model_weight_vram_bytes
-                            - _candidate_host_pinned_delta(
-                                [_idx for _idx, _free in _mm_budgeted_gpus]
-                            )
                             + mmproj_size
                             + _compute_buffer_pipeline
                             + self._CUDA_CONTEXT_RESERVE_BYTES
@@ -19012,7 +19032,7 @@ class LlamaCppBackend:
                             + (self._MTP_DRAFT_COMPUTE_BYTES if _mm_mtp_on_gpu else 0)
                         )
                         if _mm_floor_ctx > 0 and self._can_estimate_kv():
-                            _mm_need += (
+                            _mm_base_need += (
                                 _kv_bytes(_mm_floor_ctx)
                                 + _cc_bytes(_mm_floor_ctx)
                                 + _mtp_bytes(_mm_floor_ctx)
@@ -19025,7 +19045,7 @@ class LlamaCppBackend:
                             # Rebound rather than used inline so the log below names the
                             # length this actually priced against.
                             _mm_floor_ctx = self._context_length or effective_ctx or 4096
-                            _mm_need += _mtp_bytes(_mm_floor_ctx)
+                            _mm_base_need += _mtp_bytes(_mm_floor_ctx)
                         # Run through whichever selector the branch below will use, at
                         # the same fraction and per-device overhead, so "does not fit"
                         # here is a placement that branch could not have chosen either.
@@ -19044,27 +19064,43 @@ class LlamaCppBackend:
                         # whether _mm_need carries a context-compute term, so the two
                         # cannot drift apart.
                         _mm_split_aware = self._can_estimate_kv()
-                        _, _mm_needs_fit = (
-                            self._select_gpus_split_aware(
-                                _mm_need,
-                                _mm_budgeted_gpus,
-                                usable_fraction = _mm_frac,
-                                total_by_idx = total_by_idx,
-                                per_device_overhead_bytes = _pipeline_overhead_bytes
-                                + _cc_bytes(_mm_floor_ctx),
-                                min_gpus = _layer_min_gpus,
-                                split_extra_bytes = _cc_split_extra(_mm_floor_ctx),
-                            )
-                            if _mm_split_aware
-                            else self._select_gpus(
-                                _mm_need,
-                                _mm_budgeted_gpus,
-                                usable_fraction = _mm_frac,
-                                total_by_idx = total_by_idx,
-                                per_device_overhead_bytes = _pipeline_overhead_bytes,
-                                min_gpus = _layer_min_gpus,
-                            )
+                        _mm_ranked = sorted(
+                            _mm_budgeted_gpus,
+                            key = lambda g: _gpu_usable(g, _mm_frac),
+                            reverse = True,
                         )
+                        _mm_min_gpus = max(1, min(_layer_min_gpus, len(_mm_ranked)))
+                        _mm_needs_fit = True
+                        for _mm_subset in _ranked_candidate_subsets(
+                            _mm_ranked, _mm_min_gpus
+                        ):
+                            _mm_need = _mm_base_need - _candidate_host_pinned_delta(
+                                [_idx for _idx, _free in _mm_subset]
+                            )
+                            _, _mm_subset_needs_fit = (
+                                self._select_gpus_split_aware(
+                                    _mm_need,
+                                    _mm_subset,
+                                    usable_fraction = _mm_frac,
+                                    total_by_idx = total_by_idx,
+                                    per_device_overhead_bytes = _pipeline_overhead_bytes
+                                    + _cc_bytes(_mm_floor_ctx),
+                                    min_gpus = len(_mm_subset),
+                                    split_extra_bytes = _cc_split_extra(_mm_floor_ctx),
+                                )
+                                if _mm_split_aware
+                                else self._select_gpus(
+                                    _mm_need,
+                                    _mm_subset,
+                                    usable_fraction = _mm_frac,
+                                    total_by_idx = total_by_idx,
+                                    per_device_overhead_bytes = _pipeline_overhead_bytes,
+                                    min_gpus = len(_mm_subset),
+                                )
+                            )
+                            if not _mm_subset_needs_fit:
+                                _mm_needs_fit = False
+                                break
                         if _mm_needs_fit:
                             if tensor_parallel:
                                 # Held, not dropped. Applying it here would price a
@@ -19185,8 +19221,10 @@ class LlamaCppBackend:
                             if _both_fit_somewhere:
                                 break
                             _probe_min_gpus = _probe_floor(_probe_ranked, False)
-                            for _n in range(_probe_min_gpus, len(_probe_ranked) + 1):
-                                _subset = _probe_ranked[:_n]
+                            for _subset in _ranked_candidate_subsets(
+                                _probe_ranked, _probe_min_gpus
+                            ):
+                                _n = len(_subset)
                                 _cc_n = lambda c, _k = _n: _cc_bytes(c, _k)
                                 _base_wo = _probe_base(False, _n, _subset)
                                 _budget_wo = _pool_budget_mib(_subset, _probe_frac(False))
@@ -19399,29 +19437,6 @@ class LlamaCppBackend:
                         if subset:
                             size -= _candidate_host_pinned_delta([idx for idx, _free in subset])
                         return size
-
-                    def _ranked_candidate_subsets(ranked, min_count: int = 1):
-                        """Mixed-ranking prefixes plus the discrete-only alternatives.
-
-                        A shared GPU can rank first, making the ordinary prefixes the
-                        shared singleton and then the mixed pair. The discrete sibling
-                        may fit alone only after its host-pinned discount is applied, so
-                        try that same-cardinality alternative before adding a device.
-                        """
-                        discrete = [gpu for gpu in ranked if gpu[0] not in _shared_gpu_ids]
-                        subsets = []
-                        seen = set()
-                        for count in range(min_count, len(ranked) + 1):
-                            for source in (ranked, discrete):
-                                subset = source[:count]
-                                if len(subset) != count:
-                                    continue
-                                key = tuple(idx for idx, _free in subset)
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                subsets.append(subset)
-                        return subsets
 
                     # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
                     _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
