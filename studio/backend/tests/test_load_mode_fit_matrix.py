@@ -213,11 +213,12 @@ def test_the_launch_charges_the_pipeline_overhead_per_extra_device():
 
 
 class _DraftStub:
-    """Only the two readers _cpu_resident_draft_bytes consults."""
+    """Only the drafter-footprint readers _cpu_resident_draft_bytes consults."""
 
-    def __init__(self, weights, kv):
+    def __init__(self, weights, kv, tied_output = 0):
         self._weights = weights
         self._kv = kv
+        self._tied_output = tied_output
 
     def _get_gguf_size_bytes(self, path):
         if self._weights is None:
@@ -226,6 +227,9 @@ class _DraftStub:
 
     def _mtp_draft_kv_bytes(self, n_ctx, **kwargs):
         return self._kv
+
+    def _tied_output_bytes(self, path):
+        return self._tied_output
 
     _cpu_resident_draft_bytes = LlamaCppBackend._cpu_resident_draft_bytes
     _MTP_DRAFT_COMPUTE_BYTES = LlamaCppBackend._MTP_DRAFT_COMPUTE_BYTES
@@ -247,6 +251,13 @@ def test_a_cpu_pinned_drafter_is_charged_weights_plus_kv_plus_its_graph():
     stub = _DraftStub(3 * GIB, 512 * MIB)
     assert stub._cpu_resident_draft_bytes(8192, drafter_path = "d.gguf") == (
         3 * GIB + 512 * MIB + LlamaCppBackend._MTP_DRAFT_COMPUTE_BYTES
+    )
+
+
+def test_a_cpu_pinned_tied_drafter_charges_its_duplicated_output():
+    stub = _DraftStub(3 * GIB, 512 * MIB, tied_output = 256 * MIB)
+    assert stub._cpu_resident_draft_bytes(8192, drafter_path = "d.gguf") == (
+        3 * GIB + 256 * MIB + 512 * MIB + LlamaCppBackend._MTP_DRAFT_COMPUTE_BYTES
     )
 
 

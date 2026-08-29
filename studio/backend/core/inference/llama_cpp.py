@@ -11522,7 +11522,9 @@ class LlamaCppBackend:
         if not drafter_path:
             return 0
         try:
-            weights = self._get_gguf_size_bytes(drafter_path)
+            weights = self._get_gguf_size_bytes(drafter_path) + self._tied_output_bytes(
+                drafter_path
+            )
         except Exception:
             weights = 0
         if weights <= 0:
