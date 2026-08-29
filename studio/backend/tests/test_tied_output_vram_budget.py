@@ -381,9 +381,10 @@ def test_a_classified_discrete_cuda_device_is_known(backend, monkeypatch):
     assert backend._torch_unified_memory_classification_known([0]) is True
 
 
-def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch):
+@pytest.mark.parametrize("arch", ["gfx90c", "gfx1103"])
+def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch, arch):
     class _Props:
-        gcnArchName = "gfx1103"
+        gcnArchName = arch
         is_integrated = 0
 
     class _Cuda:
@@ -405,7 +406,21 @@ def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "arch", ["gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1031", "gfx1100"]
+    "arch",
+    [
+        "gfx803",
+        "gfx900",
+        "gfx906",
+        "gfx908",
+        "gfx90a",
+        "gfx942",
+        "gfx950",
+        "gfx1010",
+        "gfx1011",
+        "gfx1012",
+        "gfx1031",
+        "gfx1100",
+    ],
 )
 def test_a_known_discrete_rocm_arch_is_proved_discrete(backend, monkeypatch, arch):
     class _Props:
