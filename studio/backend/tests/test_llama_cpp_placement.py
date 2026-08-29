@@ -236,27 +236,28 @@ def test_pass_through_vulkan_pin_cancels_the_candidate_host_discount(tmp_path):
         backend._run_vulkan_probe = lambda *_a, **_kw: rows
         backend._host_pinned_vram_discount = lambda *_a, **_kw: 100
         calls = []
-        fitted_model_sizes = []
+        fit_inputs = []
 
         def select(size, gpus, **_kwargs):
             calls.append((size, list(gpus)))
             return [0], False
 
         backend._select_gpus = select
-        backend._fit_derived_load_mode = lambda **kwargs: fitted_model_sizes.append(
-            kwargs["model_size"]
+        backend._fit_derived_load_mode = lambda **kwargs: fit_inputs.append(
+            (kwargs["model_size"], kwargs["host_only_bytes"])
         )
         result = _launch(backend, gguf, extra_args = extra_args)
         assert calls and calls[-1][1] == [(0, 12_000)]
-        assert len(fitted_model_sizes) == 1
-        return fitted_model_sizes[0], result["cmd"]
+        assert len(fit_inputs) == 1
+        return fit_inputs[0], result["cmd"]
 
-    automatic_size, _cmd = planned_size()
-    restated_size, _cmd = planned_size(["--device", "Vulkan0"])
-    pinned_size, cmd = planned_size(["--device", "Vulkan1"])
+    (automatic_size, automatic_host), _cmd = planned_size()
+    (restated_size, restated_host), _cmd = planned_size(["--device", "Vulkan0"])
+    (pinned_size, pinned_host), cmd = planned_size(["--device", "Vulkan1"])
 
     assert restated_size == automatic_size
     assert pinned_size == automatic_size + 100
+    assert (automatic_host, restated_host, pinned_host) == (100, 100, 0)
     assert cmd[-2:] == ["--device", "Vulkan1"]
 
 

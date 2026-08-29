@@ -19930,7 +19930,7 @@ class LlamaCppBackend:
                         and not (set(gpu_indices) & _shared_gpu_ids)
                     ):
                         _new_discount = _candidate_host_pinned_delta(gpu_indices)
-                        _host_pinned = _host_pinned_candidate
+                        _host_pinned += _new_discount
                         _model_weight_vram_bytes = max(0, _model_weight_vram_bytes - _new_discount)
                         model_size = max(0, model_size - _new_discount)
                         model_size_fit = max(0, model_size_fit - _new_discount)
