@@ -2948,6 +2948,45 @@ def test_an_unknown_kv_type_is_still_refused_in_tensor_mode(tmp_path):
     assert backend.cache_type_kv is None
 
 
+def test_tensor_planning_prices_a_discrete_subset_with_the_host_discount(tmp_path):
+    """A small shared GPU is filtered by tensor's per-device reserve; the two
+    remaining dGPUs must receive the host-pinned discount before the downgrade
+    gate and tensor context planner run."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 1_000, 0), (1, 24_000, 24_000), (2, 24_000, 24_000)],
+    )
+    backend._read_gguf_metadata = lambda _path: setattr(backend, "_context_length", 8_192)
+    backend._get_gguf_size_bytes = lambda _path: 43 * gib
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 4 * gib
+    backend._amd_apu_wants_unified_memory = lambda ids = None: ids is None or ids == [0]
+    backend._integrated_cuda_unified_memory = lambda _ids = None: False
+    backend._torch_unified_memory_classification_known = lambda _ids = None: True
+    backend._can_estimate_kv = lambda: True
+    backend._estimate_kv_cache_bytes = lambda *_a, **_kw: 0
+    backend._compute_buffer_ctx_bytes = lambda *_a, **_kw: 0
+    backend._estimate_compute_buffer_bytes = lambda **_kw: 2 * gib
+    backend._tensor_split_aborts = lambda *_a, **_kw: False
+    backend._tensor_quant_kv_unsupported_binary = lambda *_a, **_kw: False
+    planned = {}
+    real_plan = backend._plan_tensor_parallel
+
+    def plan(gpus, model_size, *args, **kwargs):
+        planned["gpus"] = list(gpus)
+        planned["model_size"] = model_size
+        return real_plan(gpus, model_size, *args, **kwargs)
+
+    backend._plan_tensor_parallel = plan
+
+    cmd = _launch(backend, gguf, tensor_parallel = True, n_ctx = 8_192)["cmd"]
+
+    assert planned["gpus"] == [(1, 24_000), (2, 24_000)]
+    assert planned["model_size"] == 39 * gib
+    assert cmd[cmd.index("--split-mode") + 1] == "tensor"
+
+
 def test_tensor_mode_keeps_an_inherited_quantized_kv_env(tmp_path, monkeypatch):
     """The tensor-branch env scrub owns the split, not the cache type: an
     LLAMA_ARG_CACHE_TYPE_K/_V reaches the child untouched, while the tensor split

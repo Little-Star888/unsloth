@@ -7957,6 +7957,24 @@ class LlamaCppBackend:
         except Exception:
             return False
 
+    # Exact dGPU targets from Studio's supported AMD name table. Nearby targets
+    # are deliberately absent: gfx1103 is Phoenix/Hawk Point integrated graphics,
+    # gfx1150-1152 are unified-memory APUs, and an unknown/future arch stays
+    # conservative until either the driver or the shared classifier proves it.
+    _ROCM_PROVED_DISCRETE_ARCHS = frozenset(
+        {
+            "gfx1030",
+            "gfx1031",
+            "gfx1032",
+            "gfx1034",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1200",
+            "gfx1201",
+        }
+    )
+
     @staticmethod
     def _torch_unified_memory_classification_known(gpu_indices = None) -> bool:
         """Whether every selected CUDA/ROCm device was classifiable.
@@ -7989,10 +8007,14 @@ class LlamaCppBackend:
                 props = torch.cuda.get_device_properties(ordinal)
                 if is_rocm:
                     _arch, is_unified = rocm_classifier(props)
-                    if not is_unified:
+                    if (
+                        not is_unified
+                        and (_arch or "").strip().lower()
+                        not in LlamaCppBackend._ROCM_PROVED_DISCRETE_ARCHS
+                    ):
                         # ROCm exposes no reliable negative signal: older wheels
                         # omit or zero is_integrated even for Phoenix gfx1103 APUs.
-                        # A positive classification is useful; False is unknown.
+                        # Only an exact known dGPU target makes False definitive.
                         return False
                 elif not (hasattr(props, "is_integrated") or hasattr(props, "integrated")):
                     return False
@@ -19354,6 +19376,13 @@ class LlamaCppBackend:
                     _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
 
                     if tensor_parallel and tp_gpus:
+                        _tp_model_size = max(
+                            0,
+                            model_size
+                            - _candidate_host_pinned_delta(
+                                [idx for idx, _free in tp_gpus]
+                            ),
+                        )
                         # Pooled usable budget (after each device's compute buffer)
                         # must hold the non-shrinkable footprint: weights + the MTP
                         # reserve. The planner can shrink ctx/KV, not these.
@@ -19377,7 +19406,7 @@ class LlamaCppBackend:
                                 _tp_flat_mtp,
                                 _mtp_bytes(min(2048, effective_ctx) if effective_ctx > 0 else 2048),
                             )
-                        _tp_required_mib = (model_size + _tp_mtp_floor + _soft_overhead) / (
+                        _tp_required_mib = (_tp_model_size + _tp_mtp_floor + _soft_overhead) / (
                             1024 * 1024
                         )
                         if _tp_weight_budget_mib <= _tp_required_mib:
@@ -19442,7 +19471,7 @@ class LlamaCppBackend:
                             tp_tensor_split,
                         ) = self._plan_tensor_parallel(
                             tp_gpus,
-                            model_size,
+                            _tp_model_size,
                             target_ctx,
                             cache_type_kv = cache_type_kv,
                             scratch_cache_type_kv = _scratch_cache_type_kv,

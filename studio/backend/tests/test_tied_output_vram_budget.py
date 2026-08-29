@@ -366,6 +366,30 @@ def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch):
     assert backend._torch_unified_memory_classification_known([0]) is False
 
 
+@pytest.mark.parametrize("arch", ["gfx1031", "gfx1100"])
+def test_a_known_discrete_rocm_arch_is_proved_discrete(backend, monkeypatch, arch):
+    class _Props:
+        gcnArchName = arch
+        is_integrated = 0
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = "6.2.0"
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0+rocm"
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+    assert backend._torch_unified_memory_classification_known([0]) is True
+
+
 def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
     """An explicit device override outranks llama.cpp's host fallback."""
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"], env = {}) is True
