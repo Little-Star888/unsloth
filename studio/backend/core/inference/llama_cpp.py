@@ -19327,6 +19327,29 @@ class LlamaCppBackend:
                             size -= _candidate_host_pinned_delta([idx for idx, _free in subset])
                         return size
 
+                    def _ranked_candidate_subsets(ranked, min_count: int = 1):
+                        """Mixed-ranking prefixes plus the discrete-only alternatives.
+
+                        A shared GPU can rank first, making the ordinary prefixes the
+                        shared singleton and then the mixed pair. The discrete sibling
+                        may fit alone only after its host-pinned discount is applied, so
+                        try that same-cardinality alternative before adding a device.
+                        """
+                        discrete = [gpu for gpu in ranked if gpu[0] not in _shared_gpu_ids]
+                        subsets = []
+                        seen = set()
+                        for count in range(min_count, len(ranked) + 1):
+                            for source in (ranked, discrete):
+                                subset = source[:count]
+                                if len(subset) != count:
+                                    continue
+                                key = tuple(idx for idx, _free in subset)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                subsets.append(subset)
+                        return subsets
+
                     # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
                     _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
 
@@ -19456,8 +19479,8 @@ class LlamaCppBackend:
                             )
                             best_cap = 0
                             _cap_fraction = _vram_frac - _flat_mtp_reserve
-                            for n_gpus in range(1, len(ranked_for_cap) + 1):
-                                subset = ranked_for_cap[:n_gpus]
+                            for subset in _ranked_candidate_subsets(ranked_for_cap):
+                                n_gpus = len(subset)
                                 # Per-GPU-consistent pool budget (fixes mixed
                                 # known/unknown totals); pass it as an absolute
                                 # budget so the fit and the check below agree.
@@ -19578,8 +19601,9 @@ class LlamaCppBackend:
                                     or 1,
                                 ),
                             )
-                            for n_gpus in range(_auto_min_gpus, len(ranked) + 1):
-                                subset = ranked[:n_gpus]
+                            _auto_subsets = _ranked_candidate_subsets(ranked, _auto_min_gpus)
+                            for subset in _auto_subsets:
+                                n_gpus = len(subset)
                                 pool_budget = _pool_budget_mib(subset, pin_fraction)
                                 _ms = _subset_model_size(n_gpus, subset)
                                 # Compute buffer is replicated per device in a layer
@@ -19650,8 +19674,8 @@ class LlamaCppBackend:
                                 # handing placement to --fit on and host offload.
                                 effective_ctx = min(_AUTO_OFFLOAD_CTX, effective_ctx)
                                 if effective_ctx > 0:
-                                    for n_gpus in range(_auto_min_gpus, len(ranked) + 1):
-                                        subset = ranked[:n_gpus]
+                                    for subset in _auto_subsets:
+                                        n_gpus = len(subset)
                                         kv = _kv_bytes(effective_ctx)
                                         footprint_mib = (
                                             _subset_model_size(n_gpus, subset)
@@ -22898,6 +22922,105 @@ class LlamaCppBackend:
                                 self._record_load_warning(_retry_apu_msg)
                         # host guard credited the whole pool; the respawn reaches only _remaining
                         _retry_rows = [row for row in _detected_gpus if row[0] in set(_remaining)]
+                        # The crashed discrete placement may have spent its
+                        # host-pinned weight discount on a larger Auto context.
+                        # Those bytes return to the same pool when the retry lands
+                        # on an APU, so re-run the subset fit with the raw weight
+                        # footprint. This mirrors the original Auto policy: keep a
+                        # fully-offloaded fitted context when one exists; otherwise
+                        # fall back to the useful offload context and let llama.cpp's
+                        # fitter place the load. A hand-set context remains the
+                        # caller's contract and is never silently reduced here.
+                        if (
+                            _retry_wants_unified
+                            and not explicit_ctx
+                            and _host_pinned > 0
+                            and self._can_estimate_kv()
+                            and effective_ctx > 0
+                            and _retry_rows
+                        ):
+                            _retry_n_gpus = len(_retry_rows)
+                            _retry_budget_mib = _pool_budget_mib(
+                                _retry_rows, _pin_fraction
+                            )
+                            _retry_model_size_fit = (
+                                model_size_fit
+                                + _host_pinned
+                                + max(0, _retry_n_gpus - 1) * _pipeline_overhead_bytes
+                            )
+                            _retry_cc = lambda c: _cc_bytes(c, _retry_n_gpus)
+                            _retry_ctx = self._fit_context_to_vram(
+                                effective_ctx,
+                                _retry_budget_mib,
+                                _retry_model_size_fit,
+                                cache_type_kv,
+                                swa_full = swa_full,
+                                n_parallel = n_parallel,
+                                kv_unified = planned_kv_unified,
+                                n_ubatch = _effective_ubatch,
+                                ctx_checkpoints = _effective_ctx_checkpoints,
+                                flash_attn = planned_flash_attn,
+                                mtp_engaged = _mtp_reserves_gpu,
+                                mtp_overhead_fn = mtp_overhead_fn,
+                                compute_ctx_bytes_fn = _retry_cc,
+                                budget_frac = 1.0,
+                                pooled = True,
+                                total_mib = None,
+                            )
+                            _retry_footprint_mib = (
+                                _retry_model_size_fit
+                                + _kv_bytes(_retry_ctx)
+                                + _mtp_bytes(_retry_ctx)
+                                + _retry_cc(_retry_ctx)
+                            ) / (1024 * 1024)
+                            _retry_fit_proved = (
+                                _retry_footprint_mib <= _retry_budget_mib
+                                and self._every_gpu_holds_reserve(
+                                    (
+                                        _gpu_usable(g, _pin_fraction)
+                                        for g in _retry_rows
+                                    ),
+                                    (
+                                        _pipeline_overhead_bytes
+                                        if _retry_n_gpus > 1
+                                        else 0
+                                    )
+                                    + _retry_cc(_retry_ctx) // _retry_n_gpus,
+                                )
+                            )
+                            if not _retry_fit_proved:
+                                _retry_ctx = min(_AUTO_OFFLOAD_CTX, effective_ctx)
+                            if _retry_ctx != effective_ctx and "-c" in cmd:
+                                _ctx_pos = cmd.index("-c")
+                                if _ctx_pos + 1 < len(cmd):
+                                    cmd[_ctx_pos + 1] = str(_retry_ctx)
+                                    effective_ctx = _retry_ctx
+                                    max_available_ctx = min(
+                                        max_available_ctx, _retry_ctx
+                                    )
+                                    # The initial placement published these before
+                                    # the first spawn. Keep status, prompt fitting,
+                                    # and default max_tokens bound to the command the
+                                    # retry now launches rather than the crashed one.
+                                    self._effective_context_length = _retry_ctx
+                                    self._max_context_length = _retry_ctx
+                                    logger.info(
+                                        "Arch-crash retry restored %.1f GB of "
+                                        "host-pinned weights on the APU; replanned "
+                                        "Auto context to %d.",
+                                        _host_pinned / (1024**3),
+                                        _retry_ctx,
+                                    )
+                            if not _retry_fit_proved and fully_gpu_offloaded:
+                                # The first --fit is Unsloth's generated pair; any
+                                # pass-through pair is appended later and keeps its
+                                # last-wins ownership.
+                                _fit_pos = cmd.index("--fit") if "--fit" in cmd else -1
+                                if _fit_pos >= 0 and _fit_pos + 1 < len(cmd):
+                                    cmd[_fit_pos + 1] = "on"
+                                fully_gpu_offloaded = False
+                                use_fit = fit_is_effectively_on(cmd, env)
+                                _placement_verdict_partial = bool(use_fit)
                         _retry_host_msg = self._launch_host_shortfall_message(cmd, _retry_rows, env)
                         _host_ram_msg = _retry_host_msg
                         self._record_load_warning(_retry_host_msg)

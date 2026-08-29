@@ -211,6 +211,41 @@ def test_explicit_context_auto_retries_a_discrete_subset_with_the_host_discount(
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
 
 
+def test_auto_context_tries_a_discrete_singleton_before_a_mixed_prefix(tmp_path):
+    """A shared GPU can rank first even though only the discrete sibling fits
+    after host-pinned weights are removed from its VRAM budget."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 9_000, 9_000), (1, 8_000, 8_000)],
+    )
+    backend._read_gguf_metadata = lambda _path: setattr(backend, "_context_length", 32_768)
+    backend._get_gguf_size_bytes = lambda _path: 9 * gib
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 3 * gib
+    backend._amd_apu_wants_unified_memory = lambda ids = None: ids is None or ids == [0]
+    backend._integrated_cuda_unified_memory = lambda _ids = None: False
+    backend._torch_unified_memory_classification_known = lambda _ids = None: True
+    backend._can_estimate_kv = lambda: True
+    backend._estimate_kv_cache_bytes = lambda ctx, *_a, **_kw: gib * ctx // 32_768
+    backend._compute_buffer_ctx_bytes = lambda *_a, **_kw: 0
+    backend._estimate_compute_buffer_bytes = lambda **_kw: 1
+    fit_calls = []
+    real_fit = backend._fit_context_to_vram
+
+    def fit(requested, available, model_size, *args, **kwargs):
+        fit_calls.append((available, model_size))
+        return real_fit(requested, available, model_size, *args, **kwargs)
+
+    backend._fit_context_to_vram = fit
+
+    result = _launch(backend, gguf, n_ctx = 0)
+
+    assert any(model_size < 7 * gib for _available, model_size in fit_calls), fit_calls
+    assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert result["cmd"][result["cmd"].index("-c") + 1] == "32768"
+
+
 def test_pass_through_vulkan_pin_cancels_the_candidate_host_discount(tmp_path):
     """Auto budgets the discrete card, but Advanced Arguments are appended last.
     A pin to the filtered shared device must restore the host-pinned bytes."""
