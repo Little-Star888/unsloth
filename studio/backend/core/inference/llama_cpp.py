@@ -18249,9 +18249,7 @@ class LlamaCppBackend:
                     _unclassified_gpu_ids: set[int] = set()
                     if is_vulkan_backend:
                         _shared_gpu_ids = {
-                            idx
-                            for idx, _free, total in _visible_gpu_mem
-                            if total <= 0
+                            idx for idx, _free, total in _visible_gpu_mem if total <= 0
                         }
                     else:
                         _unclassified_gpu_ids = {
@@ -18268,9 +18266,8 @@ class LlamaCppBackend:
 
                     def _candidate_targets_proved_discrete(candidate_ids) -> bool:
                         _candidate_ids = {int(idx) for idx in (candidate_ids or ())}
-                        if (
-                            not _candidate_ids
-                            or (_candidate_ids & (_shared_gpu_ids | _unclassified_gpu_ids))
+                        if not _candidate_ids or (
+                            _candidate_ids & (_shared_gpu_ids | _unclassified_gpu_ids)
                         ):
                             return False
                         # Advanced Arguments are appended after the generated
@@ -19520,10 +19517,7 @@ class LlamaCppBackend:
                     # projector, costing context rather than correctness.
                     _shared_pool_mmproj = (
                         _mmproj_pinned_bytes
-                        if (
-                            not gpus
-                            or bool(_shared_gpu_ids | _unclassified_gpu_ids)
-                        )
+                        if (not gpus or bool(_shared_gpu_ids | _unclassified_gpu_ids))
                         else 0
                     )
                     model_size_fit = (
@@ -19533,13 +19527,10 @@ class LlamaCppBackend:
                     def _candidate_shared_pool_mmproj_delta(candidate_ids) -> int:
                         """CPU-projector bytes removed only when the effective target
                         placement is the same proved-discrete candidate."""
-                        _available = (
-                            _shared_pool_mmproj + _candidate_mmproj_discount_applied
-                        )
+                        _available = _shared_pool_mmproj + _candidate_mmproj_discount_applied
                         return (
                             _available
-                            if _available > 0
-                            and _candidate_targets_proved_discrete(candidate_ids)
+                            if _available > 0 and _candidate_targets_proved_discrete(candidate_ids)
                             else 0
                         )
 
@@ -19569,17 +19560,13 @@ class LlamaCppBackend:
                         _candidate_mmproj_discount_applied = _projector
                         _host_pinned += _target_change
                         _draft_host_pinned += _draft_change
-                        _model_weight_vram_bytes = max(
-                            0, _model_weight_vram_bytes - _target_change
-                        )
+                        _model_weight_vram_bytes = max(0, _model_weight_vram_bytes - _target_change)
                         model_size = max(0, model_size - _target_change)
                         model_size_fit = max(
                             0,
                             model_size_fit - _target_change - _projector_change,
                         )
-                        _shared_pool_mmproj = max(
-                            0, _shared_pool_mmproj - _projector_change
-                        )
+                        _shared_pool_mmproj = max(0, _shared_pool_mmproj - _projector_change)
                         return _target_change, _draft_change, _projector_change
 
                     def _subset_model_size(n_gpus: int, subset = None) -> int:
@@ -19656,10 +19643,7 @@ class LlamaCppBackend:
                                     _soft_overhead += self._MTP_DRAFT_COMPUTE_BYTES
                                 _shared_pool_mmproj = (
                                     _mmproj_pinned_bytes
-                                    if (
-                                        not gpus
-                                        or bool(_shared_gpu_ids | _unclassified_gpu_ids)
-                                    )
+                                    if (not gpus or bool(_shared_gpu_ids | _unclassified_gpu_ids))
                                     else 0
                                 )
                                 model_size_fit = (
@@ -20247,13 +20231,10 @@ class LlamaCppBackend:
                         # mixed pool with the discounted footprint could switch to
                         # shared or unclassified memory without restoring the bytes.
                         _slot_gpus = gpus
-                        if (
-                            gpu_indices
-                            and (
-                                _candidate_target_discount_applied
-                                or _candidate_draft_discount_applied
-                                or _candidate_mmproj_discount_applied
-                            )
+                        if gpu_indices and (
+                            _candidate_target_discount_applied
+                            or _candidate_draft_discount_applied
+                            or _candidate_mmproj_discount_applied
                         ):
                             _slot_ids = set(gpu_indices)
                             _slot_gpus = [gpu for gpu in gpus if gpu[0] in _slot_ids]
