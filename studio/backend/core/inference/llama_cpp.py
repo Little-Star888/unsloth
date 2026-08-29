@@ -18175,13 +18175,33 @@ class LlamaCppBackend:
                     def _candidate_host_pinned_delta(candidate_ids) -> int:
                         """Discount host-pinned weights only for an automatic
                         placement whose complete candidate set is discrete."""
+                        _candidate_ids = {int(idx) for idx in (candidate_ids or ())}
                         if (
                             gpu_ids
-                            or not candidate_ids
+                            or not _candidate_ids
                             or _host_pinned_candidate <= _host_pinned
-                            or (set(candidate_ids) & _shared_gpu_ids)
+                            or (_candidate_ids & _shared_gpu_ids)
                         ):
                             return 0
+                        # Advanced Arguments are appended after the generated
+                        # Vulkan pin and llama.cpp is last-wins. Vulkan names map
+                        # exactly to probe ordinals, so a restatement is safe; a
+                        # different or unreadable pin may put the load back on a
+                        # shared device. CUDA/ROCm names cannot be mapped through
+                        # the visibility masks here, so remain conservative.
+                        _pass_through_device = _extra_args_main_device(extra_args)
+                        if _pass_through_device is not None:
+                            _named_devices = {
+                                name.strip().lower()
+                                for name in str(_pass_through_device).split(",")
+                                if name.strip()
+                            }
+                            if (
+                                not is_vulkan_backend
+                                or _named_devices
+                                != {f"vulkan{idx}" for idx in _candidate_ids}
+                            ):
+                                return 0
                         return _host_pinned_candidate - _host_pinned
 
                     # The --fit fallback is llama.cpp's own fitter, which knows nothing

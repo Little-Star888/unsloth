@@ -211,6 +211,55 @@ def test_explicit_context_auto_retries_a_discrete_subset_with_the_host_discount(
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "0"
 
 
+def test_pass_through_vulkan_pin_cancels_the_candidate_host_discount(tmp_path):
+    """Auto budgets the discrete card, but Advanced Arguments are appended last.
+    A pin to the filtered shared device must restore the host-pinned bytes."""
+    rows = [
+        {
+            "index": 0,
+            "free_mib": 12_000,
+            "total_mib": 16_000,
+            "is_igpu": False,
+            "name": "Vulkan0",
+        },
+        {
+            "index": 1,
+            "free_mib": 1_000,
+            "total_mib": 1_000,
+            "is_igpu": True,
+            "name": "Vulkan1",
+        },
+    ]
+
+    def planned_size(extra_args = None):
+        backend, gguf = _backend(tmp_path, vulkan = True, memory = [])
+        backend._run_vulkan_probe = lambda *_a, **_kw: rows
+        backend._host_pinned_vram_discount = lambda *_a, **_kw: 100
+        calls = []
+        fitted_model_sizes = []
+
+        def select(size, gpus, **_kwargs):
+            calls.append((size, list(gpus)))
+            return [0], False
+
+        backend._select_gpus = select
+        backend._fit_derived_load_mode = lambda **kwargs: fitted_model_sizes.append(
+            kwargs["model_size"]
+        )
+        result = _launch(backend, gguf, extra_args = extra_args)
+        assert calls and calls[-1][1] == [(0, 12_000)]
+        assert len(fitted_model_sizes) == 1
+        return fitted_model_sizes[0], result["cmd"]
+
+    automatic_size, _cmd = planned_size()
+    restated_size, _cmd = planned_size(["--device", "Vulkan0"])
+    pinned_size, cmd = planned_size(["--device", "Vulkan1"])
+
+    assert restated_size == automatic_size
+    assert pinned_size == automatic_size + 100
+    assert cmd[-2:] == ["--device", "Vulkan1"]
+
+
 def test_vulkan_selection_uses_ordinals_and_owns_device_flags(tmp_path):
     backend, gguf = _backend(
         tmp_path,
