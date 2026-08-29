@@ -445,6 +445,40 @@ def test_a_known_discrete_rocm_arch_is_proved_discrete(backend, monkeypatch, arc
     assert backend._torch_unified_memory_classification_known([0]) is True
 
 
+def test_an_hsa_override_cannot_spoof_an_apu_into_a_discrete_discount(backend, monkeypatch):
+    """The runtime arch is valid for kernel selection under the override, but it is
+    not evidence about the underlying memory topology used by the VRAM budget."""
+
+    class _Props:
+        gcnArchName = "gfx1030"
+        # Older ROCm wheels omit/zero this even for the gfx1035 laptop APU that is
+        # commonly presented as gfx1030 through HSA_OVERRIDE_GFX_VERSION.
+        is_integrated = 0
+
+    class _Cuda:
+        is_available = staticmethod(lambda: True)
+        device_count = staticmethod(lambda: 1)
+        get_device_properties = staticmethod(lambda _ordinal: _Props())
+
+    class _Version:
+        hip = "6.4"
+
+    class _Torch:
+        cuda = _Cuda()
+        version = _Version()
+        __version__ = "2.9.0"
+
+    monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setattr(backend, "_resolve_visible_physical_ids", staticmethod(lambda: None))
+
+    assert backend._torch_unified_memory_classification_known([0]) is False
+    # The override invalidates arch-only DISCRETE proof, not a positive unified-memory
+    # signal from the device properties.
+    _Props.is_integrated = 1
+    assert backend._torch_unified_memory_classification_known([0]) is True
+
+
 def test_a_user_override_to_a_gpu_buffer_cancels_the_discount(backend):
     """An explicit device override outranks llama.cpp's host fallback."""
     assert backend._override_moves_host_pinned(["-ot", "token_embd.weight=CUDA0"], env = {}) is True

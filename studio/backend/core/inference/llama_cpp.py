@@ -8154,9 +8154,18 @@ class LlamaCppBackend:
                 return False
             is_rocm = LlamaCppBackend._torch_is_rocm(torch)
             rocm_classifier = None
+            rocm_arch_overridden = False
             if is_rocm:
                 from core.training.worker import _rocm_classify_unified_memory
                 rocm_classifier = _rocm_classify_unified_memory
+                # HSA_OVERRIDE_GFX_VERSION changes the architecture ROCr reports so
+                # kernels built for a neighbouring target can run. That presented
+                # target is valid for compatibility gating, but says nothing about
+                # the underlying memory topology: a gfx1035 APU commonly appears as
+                # allowlisted-discrete gfx1030. Fail closed for this discount.
+                rocm_arch_overridden = bool(
+                    str(os.environ.get("HSA_OVERRIDE_GFX_VERSION", "")).strip()
+                )
             physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
             wanted = set(gpu_indices) if gpu_indices else None
             seen: set[int] = set()
@@ -8173,8 +8182,11 @@ class LlamaCppBackend:
                     _arch, is_unified = rocm_classifier(props)
                     if (
                         not is_unified
-                        and (_arch or "").strip().lower()
-                        not in LlamaCppBackend._ROCM_PROVED_DISCRETE_ARCHS
+                        and (
+                            rocm_arch_overridden
+                            or (_arch or "").strip().lower()
+                            not in LlamaCppBackend._ROCM_PROVED_DISCRETE_ARCHS
+                        )
                     ):
                         # ROCm exposes no reliable negative signal: older wheels
                         # omit or zero is_integrated even for Phoenix gfx1103 APUs.
@@ -21577,6 +21589,19 @@ class LlamaCppBackend:
                     # launched None would reload a healthy server on every repeat Apply.
                     _pv_suppressed_draft_path = launch_mtp_draft_path
                     launch_mtp_draft_path = None
+                    # Fit ran before this platform guard, but the final argv no longer
+                    # loads a drafter. Clear every companion ledger that host preflight,
+                    # CPU replay, or later GPU retry could otherwise carry forward.
+                    _mtp_will_engage = False
+                    _draft_host_pinned = 0
+                    _draft_host_pinned_floor = 0
+                    _draft_host_pinned_candidate = 0
+                    _mtp_draft_weights = 0
+                    _mtp_draft_weights_candidate = 0
+                    _candidate_draft_discount_applied = 0
+                    _replay_draft_fit_bytes = 0
+                    mtp_overhead_fn = None
+                    _mtp_kv_unsized = False
                     if extra_args:
                         # Same reason: record the extras as REQUESTED next to the
                         # launched ones. Both comparators key on the caller's list,
