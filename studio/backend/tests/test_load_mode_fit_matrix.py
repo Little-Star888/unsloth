@@ -215,7 +215,12 @@ def test_the_launch_charges_the_pipeline_overhead_per_extra_device():
 class _DraftStub:
     """Only the drafter-footprint readers _cpu_resident_draft_bytes consults."""
 
-    def __init__(self, weights, kv, tied_output = 0):
+    def __init__(
+        self,
+        weights,
+        kv,
+        tied_output = 0,
+    ):
         self._weights = weights
         self._kv = kv
         self._tied_output = tied_output
