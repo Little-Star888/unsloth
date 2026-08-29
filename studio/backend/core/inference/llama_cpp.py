@@ -7315,9 +7315,7 @@ class LlamaCppBackend:
             for path, _size, _mtime in stats:
                 for tensor in GGUFReader(path).tensors:
                     name = str(tensor.name)
-                    if name == "token_embd.weight" or name.startswith(
-                        "per_layer_token_embd"
-                    ):
+                    if name == "token_embd.weight" or name.startswith("per_layer_token_embd"):
                         items.append((name, int(tensor.n_bytes)))
             return tuple(items)
         except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
@@ -7444,9 +7442,7 @@ class LlamaCppBackend:
             return raw
         if not items:
             return raw
-        exact_gpu_names = {
-            pattern for pattern, buft in mappings if buft.upper() != "CPU"
-        }
+        exact_gpu_names = {pattern for pattern, buft in mappings if buft.upper() != "CPU"}
         return sum(size for name, size in items if name not in exact_gpu_names)
 
     @staticmethod

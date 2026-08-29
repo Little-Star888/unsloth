@@ -2457,9 +2457,7 @@ def test_host_pinned_weights_keep_an_unmapped_load_from_spending_surplus_vram(
     assert "memory mapping instead" in (backend.last_load_warning or "")
 
 
-def test_an_unrelated_tensor_override_cannot_erase_the_physical_host_floor(
-    tmp_path, monkeypatch
-):
+def test_an_unrelated_tensor_override_cannot_erase_the_physical_host_floor(tmp_path, monkeypatch):
     """An arbitrary non-CPU tensor override makes the VRAM discount uncertain,
     but it is not proof that normally host-pinned embeddings moved off RAM."""
     gib = 1024**3
@@ -2492,9 +2490,7 @@ def test_an_unrelated_tensor_override_cannot_erase_the_physical_host_floor(
     assert "About 8 GB" in (backend.last_load_warning or "")
 
 
-def test_an_exact_embedding_override_removes_the_moved_target_host_floor(
-    tmp_path, monkeypatch
-):
+def test_an_exact_embedding_override_removes_the_moved_target_host_floor(tmp_path, monkeypatch):
     """The conservative floor must not survive proof that the only host-pinned
     target tensor is explicitly moved to a GPU buffer."""
     gib = 1024**3
@@ -2528,9 +2524,7 @@ def test_an_exact_embedding_override_removes_the_moved_target_host_floor(
     assert backend.last_load_warning is None
 
 
-def test_an_unrelated_draft_override_cannot_erase_the_drafter_host_floor(
-    tmp_path, monkeypatch
-):
+def test_an_unrelated_draft_override_cannot_erase_the_drafter_host_floor(tmp_path, monkeypatch):
     """A separate GPU drafter owns its override and its physical embedding floor;
     an uncertain draft regex must not delete those host-only bytes."""
     gib = 1024**3
