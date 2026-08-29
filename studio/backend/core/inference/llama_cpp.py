@@ -4632,9 +4632,7 @@ def _extra_args_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optiona
     return last_dev
 
 
-def _extra_args_effective_draft_device_pin(
-    extra_args: Optional[Iterable[str]],
-) -> Optional[str]:
+def _extra_args_effective_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optional[str]:
     """Return the GPU device selection the separate drafter will inherit.
 
     An explicit draft-device value owns the drafter, including cpu/none. Without
