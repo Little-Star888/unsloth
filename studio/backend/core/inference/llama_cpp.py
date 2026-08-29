@@ -18725,8 +18725,20 @@ class LlamaCppBackend:
                     _separate_draft_launches = bool(_mtp_draft_for_budget)
                     # Drafter offloaded to CPU keeps its weights+KV off the GPU, so
                     # drop it from the budget (an embedded head stays in the model).
-                    # Consult the env too: the child honors LLAMA_ARG_N_GPU_LAYERS_DRAFT.
-                    _draft_on_cpu = _extra_args_draft_offloaded_to_cpu(extra_args, env = os.environ)
+                    # Classify the placement the child receives. An explicit gpu_ids
+                    # selection strips main-device flags and their env twins before launch,
+                    # so a raw main ``--device none`` cannot make a GPU drafter vanish
+                    # from this reserve. Draft-specific placement remains effective.
+                    _draft_placement_extras = extra_args
+                    _draft_placement_env: Mapping[str, str] = os.environ
+                    if gpu_ids is not None:
+                        _draft_placement_extras = self._strip_device_extra_args(extra_args)
+                        _draft_placement_env = dict(os.environ)
+                        self._clear_device_placement_env(_draft_placement_env)
+                    _draft_on_cpu = _extra_args_draft_offloaded_to_cpu(
+                        _draft_placement_extras,
+                        env = _draft_placement_env,
+                    )
                     # Kept for the load-mode fit, which the nulling below would leave
                     # short a whole draft GGUF: dropping the drafter from the VRAM budget
                     # moves those bytes to host RAM rather than deleting them. See

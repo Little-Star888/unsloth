@@ -2762,6 +2762,88 @@ def test_a_separate_drafter_inherits_the_main_cpu_pin_in_the_host_guard(tmp_path
     assert "About 8 GB" in (backend.last_load_warning or "")
 
 
+@pytest.mark.parametrize(
+    "extra_args,env_device",
+    [(["--device", "none"], None), (None, "none")],
+    ids = ["argv", "env"],
+)
+def test_gpu_ids_keeps_a_stripped_main_cpu_pin_out_of_the_drafter_budget(
+    tmp_path, monkeypatch, extra_args, env_device
+):
+    """gpu_ids removes a main device flag before launch, so the same stale flag
+    cannot classify the separate drafter as CPU-resident while sizing VRAM."""
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_000, 24_000)])
+    drafter = tmp_path / "gpu-drafter.gguf"
+    drafter.write_bytes(b"draft")
+    budgeted = []
+    backend._resolve_launch_mtp_path = lambda **_kwargs: str(drafter)
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 0
+    backend._separate_drafter_weight_vram_bytes = (
+        lambda path, _discount: budgeted.append(path) or 0
+    )
+    backend._mtp_draft_kv_bytes = lambda *_a, **_kw: 0
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    backend.probe_server_capabilities = lambda _binary = None: {
+        "mtp_token": "draft-mtp",
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+    }
+    if env_device is not None:
+        monkeypatch.setenv("LLAMA_ARG_DEVICE", env_device)
+
+    result = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(drafter),
+        speculative_type = "mtp",
+        gpu_ids = [0],
+        extra_args = extra_args,
+    )
+
+    assert budgeted == [str(drafter), str(drafter)]
+    cmd = result["cmd"]
+    assert "--device" not in cmd
+    assert "LLAMA_ARG_DEVICE" not in result["env"]
+    assert cmd[cmd.index("--model-draft") + 1] == str(drafter)
+
+
+@pytest.mark.parametrize(
+    "draft_cpu_args",
+    [["--spec-draft-device", "cpu"], ["--gpu-layers-draft", "0"]],
+    ids = ["device", "layers"],
+)
+def test_gpu_ids_preserves_an_explicit_cpu_drafter_in_the_budget(
+    tmp_path, draft_cpu_args
+):
+    """The explicit GPU selection only owns main-device placement; a draft CPU
+    pin still removes the separate drafter from VRAM and survives to the child."""
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_000, 24_000)])
+    drafter = tmp_path / "cpu-drafter.gguf"
+    drafter.write_bytes(b"draft")
+    budgeted = []
+    backend._resolve_launch_mtp_path = lambda **_kwargs: str(drafter)
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 0
+    backend._separate_drafter_weight_vram_bytes = (
+        lambda path, _discount: budgeted.append(path) or 0
+    )
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    backend.probe_server_capabilities = lambda _binary = None: {
+        "mtp_token": "draft-mtp",
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+    }
+
+    cmd = _launch(
+        backend,
+        gguf,
+        mtp_draft_path = str(drafter),
+        speculative_type = "mtp",
+        gpu_ids = [0],
+        extra_args = draft_cpu_args,
+    )["cmd"]
+
+    assert budgeted == []
+    assert all(token in cmd for token in draft_cpu_args)
+
+
 def test_an_unsized_cpu_drafter_makes_an_unmapped_load_pageable(tmp_path, monkeypatch):
     """An engaged CPU drafter whose footprint cannot be read cannot be proved to
     fit host RAM; preserve the conservative pageable-load safety valve."""
