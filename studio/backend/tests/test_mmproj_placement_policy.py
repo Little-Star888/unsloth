@@ -103,8 +103,13 @@ def _backend(
     backend._resolve_launch_mtp_path = lambda **_kw: str(drafter) if drafter_bytes else None
     backend._apu_ram_shortfall_message = lambda *_a, **_kw: None
     shared_ids = {idx for idx, _free, total in memory if total <= 0}
+    known_ids = {idx for idx, _free, total in memory if total > 0}
     backend._amd_apu_wants_unified_memory = lambda ids = None: (
         bool(shared_ids) if ids is None else bool(set(ids) & shared_ids)
+    )
+    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
+    backend._torch_unified_memory_classification_known = lambda ids = None: (
+        bool(known_ids) if ids is None else bool(ids) and set(ids).issubset(known_ids)
     )
     backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
     backend._is_vulkan_backend = lambda _binary = None: False
@@ -1444,6 +1449,43 @@ def test_a_pinned_projector_is_removed_from_a_discrete_subset_budget(tmp_path):
 
     assert result["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     assert pinned_ctx == int(ref_result["cmd"][ref_result["cmd"].index("-c") + 1])
+
+
+def test_a_shared_vulkan_override_keeps_the_pinned_projector_charge(tmp_path):
+    """The generated candidate is Vulkan0, but the trailing override wins and
+    runs on Vulkan1's shared heap. The CPU projector stays in that same pool."""
+    memory = [(0, 9_000, 16_384), (1, 1_000, 0)]
+    rows = [
+        {"index": 0, "free_mib": 9_000, "total_mib": 16_384, "is_igpu": False},
+        {"index": 1, "free_mib": 1_000, "total_mib": 0, "is_igpu": True},
+    ]
+
+    def launch(*, model_bytes, mmproj_bytes, device):
+        backend, gguf = _backend(
+            tmp_path,
+            memory = memory,
+            model_bytes = model_bytes,
+            mmproj_bytes = mmproj_bytes,
+        )
+        backend._is_vulkan_backend = lambda _binary = None: True
+        backend._run_vulkan_probe = lambda *_a, **_kw: rows
+        return _launch(
+            backend,
+            gguf,
+            extra_args = ["--no-mmproj-offload", "--device", device],
+        )
+
+    shared = launch(model_bytes = 6 * GIB, mmproj_bytes = GIB, device = "Vulkan1")
+    charged = launch(model_bytes = 7 * GIB, mmproj_bytes = 0, device = "Vulkan1")
+    discrete = launch(model_bytes = 6 * GIB, mmproj_bytes = GIB, device = "Vulkan0")
+    uncharged = launch(model_bytes = 6 * GIB, mmproj_bytes = 0, device = "Vulkan0")
+
+    def ctx(result):
+        return int(result["cmd"][result["cmd"].index("-c") + 1])
+
+    assert shared["cmd"][-2:] == ["--device", "Vulkan1"]
+    assert ctx(shared) == ctx(charged)
+    assert ctx(discrete) == ctx(uncharged)
 
 
 def _estimator_config(model_path, mmproj_path = None):

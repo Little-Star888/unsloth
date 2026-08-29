@@ -786,6 +786,7 @@ def _run_auto_load(
     backend = None,
     context_length = None,
     kv_bytes_stub = None,
+    configure_backend = None,
 ):
     """Drive a real automatic (no explicit GPU pick) llama-server load with the real
     ``_get_gpu_memory`` behind it, and return the spawned (cmd, env) list.
@@ -834,6 +835,8 @@ def _run_auto_load(
     backend._find_llama_server_binary = lambda include_denied = False: binary
     backend._fit_off_retry_eligible = lambda *_args, **_kwargs: False
     backend.probe_server_capabilities = lambda _binary: {"found": True}
+    if configure_backend is not None:
+        configure_backend(backend)
     backend._record_server_pid = lambda _pid: None
     backend._clear_server_pid = lambda: None
     # env_extra seeds the child env the way an inherited / user-set variable
@@ -2245,6 +2248,64 @@ class TestArchCrashRetryRechecksTheApuRamGuard:
         assert "--no-mmap" not in retry_cmd
         assert backend._effective_context_length == 8192
         assert backend._max_context_length == 8192
+
+    def test_retry_onto_an_apu_restores_a_drafter_only_discount(
+        self, tmp_path, monkeypatch, probe_env
+    ):
+        """A separate drafter can own the entire discrete-only discount. The
+        retry must still run and restore those bytes before sizing the APU."""
+        gib = 1024**3
+        torch = self._dgpu_then_apu(monkeypatch)
+        draft = tmp_path / "draft.gguf"
+        draft.write_bytes(b"draft")
+        backend = LlamaCppBackend()
+        backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
+        backend._fit_derived_load_mode = lambda **_kw: "none"
+
+        def configure(candidate):
+            candidate._get_gguf_size_bytes = lambda path: (
+                4 * gib if Path(path) == draft else 20 * gib
+            )
+            candidate._host_pinned_vram_discount = (
+                lambda *_a, draft_model = False, **_kw: 4 * gib if draft_model else 0
+            )
+            candidate._draft_backend_for = lambda _path: types.SimpleNamespace(
+                _n_layers = 32,
+                _architecture = "gemma3",
+                _can_estimate_kv = lambda: True,
+                _estimate_kv_cache_bytes = lambda *_a, **_kw: 1,
+            )
+            candidate.probe_server_capabilities = lambda _binary: {
+                "found": True,
+                "mtp_token": "draft-mtp",
+                "spec_draft_n_max_flag": "--spec-draft-n-max",
+                "supports_kv_unified": True,
+            }
+
+        launches = _run_auto_load(
+            monkeypatch,
+            tmp_path,
+            torch,
+            None,
+            returncode = 1,
+            output = "ROCm error: device kernel image is invalid",
+            model_bytes = 20 * gib,
+            backend = backend,
+            context_length = 32_768,
+            kv_bytes_stub = lambda ctx, *_a, **_kw: 8 * gib * ctx // 32_768,
+            intent_kwargs = {
+                "n_ctx": 0,
+                "mtp_draft_path": str(draft),
+                "speculative_type": "auto",
+            },
+            configure_backend = configure,
+        )
+
+        first_cmd = launches[0][0]
+        retry_cmd = next(cmd for cmd, env in launches if env.get("ROCR_VISIBLE_DEVICES") == "1")
+        assert first_cmd[first_cmd.index("-c") + 1] == "32768"
+        assert int(retry_cmd[retry_cmd.index("-c") + 1]) < 32_768
+        assert retry_cmd[retry_cmd.index("--fit") + 1] == "on"
 
     def test_a_model_that_fits_still_retries_onto_the_apu(self, tmp_path, monkeypatch, probe_env):
         """The guard warns on a shortfall, it does not block the fallback. With

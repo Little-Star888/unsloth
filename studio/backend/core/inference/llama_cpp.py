@@ -18038,7 +18038,9 @@ class LlamaCppBackend:
                 _draft_host_pinned = 0
                 _draft_host_pinned_candidate = 0
                 _mtp_draft_weights_candidate = 0
+                _candidate_target_discount_applied = 0
                 _candidate_draft_discount_applied = 0
+                _candidate_mmproj_discount_applied = 0
                 _cpu_draft_fit_bytes: Optional[int] = 0
                 _replay_draft_fit_bytes: Optional[int] = 0
                 # "none" once the fit proves the load needs no demand paging, else None
@@ -18200,6 +18202,10 @@ class LlamaCppBackend:
                                 "get GPU inference back.",
                                 _present,
                             )
+                    # Keep the pre-filter inventory: Vulkan Auto drops integrated
+                    # siblings when a dGPU exists, but a trailing --device can still
+                    # put the child back on one of those shared heaps.
+                    _visible_gpu_mem = list(_gpu_mem)
                     if is_vulkan_backend and not gpu_ids and gpu_memory_mode != "manual":
                         _gpu_mem = self._vulkan_auto_gpu_memory(_gpu_mem)
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
@@ -18225,7 +18231,7 @@ class LlamaCppBackend:
                         # load on CPU (issue #7164).
                         _sel_gpus = [g for g in gpus if g[0] in _wanted_ids]
                         gpus = _sel_gpus if _sel_gpus else gpus
-                    total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
+                    total_by_idx = {idx: total for idx, _f, total in _visible_gpu_mem}
                     # GPU picker: restrict every mode to the chosen devices, so
                     # auto selection only considers them and manual mask to
                     # them (the env block below pins CUDA/HIP_VISIBLE_DEVICES).
@@ -18243,7 +18249,9 @@ class LlamaCppBackend:
                     _unclassified_gpu_ids: set[int] = set()
                     if is_vulkan_backend:
                         _shared_gpu_ids = {
-                            idx for idx, _free in _detected_gpus if total_by_idx.get(idx, 1) <= 0
+                            idx
+                            for idx, _free, total in _visible_gpu_mem
+                            if total <= 0
                         }
                     else:
                         _unclassified_gpu_ids = {
@@ -18258,16 +18266,13 @@ class LlamaCppBackend:
                             or self._integrated_cuda_unified_memory([idx])
                         }
 
-                    def _candidate_target_host_pinned_delta(candidate_ids) -> int:
-                        """Discount host-pinned weights only for an automatic
-                        placement whose complete candidate set is discrete."""
+                    def _candidate_targets_proved_discrete(candidate_ids) -> bool:
                         _candidate_ids = {int(idx) for idx in (candidate_ids or ())}
                         if (
                             not _candidate_ids
-                            or _host_pinned_candidate <= _host_pinned
                             or (_candidate_ids & (_shared_gpu_ids | _unclassified_gpu_ids))
                         ):
-                            return 0
+                            return False
                         # Advanced Arguments are appended after the generated
                         # Vulkan pin and llama.cpp is last-wins. Vulkan names map
                         # exactly to probe ordinals, so a restatement is safe; a
@@ -18284,8 +18289,18 @@ class LlamaCppBackend:
                             if not is_vulkan_backend or _named_devices != {
                                 f"vulkan{idx}" for idx in _candidate_ids
                             }:
-                                return 0
-                        return _host_pinned_candidate - _host_pinned
+                                return False
+                        return True
+
+                    def _candidate_target_host_pinned_delta(candidate_ids) -> int:
+                        """Target-weight discount for this effective placement."""
+                        _base_host_pinned = _host_pinned - _candidate_target_discount_applied
+                        if (
+                            _host_pinned_candidate <= _base_host_pinned
+                            or not _candidate_targets_proved_discrete(candidate_ids)
+                        ):
+                            return 0
+                        return _host_pinned_candidate - _base_host_pinned
 
                     # The --fit fallback is llama.cpp's own fitter, which knows nothing
                     # about this budget: it keeps its own margin and packs the rest on,
@@ -18599,10 +18614,13 @@ class LlamaCppBackend:
 
                     def _candidate_draft_host_pinned_delta(candidate_ids) -> int:
                         _candidate_ids = {int(idx) for idx in (candidate_ids or ())}
+                        _base_draft_host_pinned = (
+                            _draft_host_pinned - _candidate_draft_discount_applied
+                        )
                         if (
                             not _mtp_draft_for_budget
                             or not _candidate_ids
-                            or _draft_host_pinned_candidate <= _draft_host_pinned
+                            or _draft_host_pinned_candidate <= _base_draft_host_pinned
                             or (_candidate_ids & (_shared_gpu_ids | _unclassified_gpu_ids))
                         ):
                             return 0
@@ -19502,22 +19520,74 @@ class LlamaCppBackend:
                     # projector, costing context rather than correctness.
                     _shared_pool_mmproj = (
                         _mmproj_pinned_bytes
-                        if (not gpus or len(_mm_budgeted_gpus) < len(gpus))
+                        if (
+                            not gpus
+                            or bool(_shared_gpu_ids | _unclassified_gpu_ids)
+                        )
                         else 0
                     )
                     model_size_fit = (
                         model_size + _compute_buffer_pipeline + _soft_overhead + _shared_pool_mmproj
                     )
 
+                    def _candidate_shared_pool_mmproj_delta(candidate_ids) -> int:
+                        """CPU-projector bytes removed only when the effective target
+                        placement is the same proved-discrete candidate."""
+                        _available = (
+                            _shared_pool_mmproj + _candidate_mmproj_discount_applied
+                        )
+                        return (
+                            _available
+                            if _available > 0
+                            and _candidate_targets_proved_discrete(candidate_ids)
+                            else 0
+                        )
+
+                    def _apply_candidate_discounts(candidate_ids) -> tuple[int, int, int]:
+                        """Make candidate-specific accounting exactly match this set.
+
+                        Returns signed target, drafter, and projector changes. Negative
+                        values restore bytes when placement moves back to shared or
+                        unclassified memory.
+                        """
+                        nonlocal _candidate_target_discount_applied
+                        nonlocal _candidate_draft_discount_applied
+                        nonlocal _candidate_mmproj_discount_applied
+                        nonlocal _host_pinned, _draft_host_pinned
+                        nonlocal _model_weight_vram_bytes, model_size, model_size_fit
+                        nonlocal _shared_pool_mmproj
+
+                        _target = _candidate_target_host_pinned_delta(candidate_ids)
+                        _draft = _candidate_draft_host_pinned_delta(candidate_ids)
+                        _projector = _candidate_shared_pool_mmproj_delta(candidate_ids)
+                        _target_change = _target - _candidate_target_discount_applied
+                        _draft_change = _draft - _candidate_draft_discount_applied
+                        _projector_change = _projector - _candidate_mmproj_discount_applied
+
+                        _candidate_target_discount_applied = _target
+                        _candidate_draft_discount_applied = _draft
+                        _candidate_mmproj_discount_applied = _projector
+                        _host_pinned += _target_change
+                        _draft_host_pinned += _draft_change
+                        _model_weight_vram_bytes = max(
+                            0, _model_weight_vram_bytes - _target_change
+                        )
+                        model_size = max(0, model_size - _target_change)
+                        model_size_fit = max(
+                            0,
+                            model_size_fit - _target_change - _projector_change,
+                        )
+                        _shared_pool_mmproj = max(
+                            0, _shared_pool_mmproj - _projector_change
+                        )
+                        return _target_change, _draft_change, _projector_change
+
                     def _subset_model_size(n_gpus: int, subset = None) -> int:
                         size = model_size_fit + max(0, n_gpus - 1) * _pipeline_overhead_bytes
                         if subset:
                             _subset_ids = [idx for idx, _free in subset]
                             size -= _candidate_host_pinned_delta(_subset_ids)
-                            if _shared_pool_mmproj and not (
-                                set(_subset_ids) & (_shared_gpu_ids | _unclassified_gpu_ids)
-                            ):
-                                size -= _shared_pool_mmproj
+                            size -= _candidate_shared_pool_mmproj_delta(_subset_ids)
                         return size
 
                     # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
@@ -19586,7 +19656,10 @@ class LlamaCppBackend:
                                     _soft_overhead += self._MTP_DRAFT_COMPUTE_BYTES
                                 _shared_pool_mmproj = (
                                     _mmproj_pinned_bytes
-                                    if (not gpus or len(_mm_budgeted_gpus) < len(gpus))
+                                    if (
+                                        not gpus
+                                        or bool(_shared_gpu_ids | _unclassified_gpu_ids)
+                                    )
                                     else 0
                                 )
                                 model_size_fit = (
@@ -19743,7 +19816,9 @@ class LlamaCppBackend:
                                         - _candidate_host_pinned_delta(
                                             [idx for idx, _free in _discountable_gpus]
                                         )
-                                        - _shared_pool_mmproj
+                                        - _candidate_shared_pool_mmproj_delta(
+                                            [idx for idx, _free in _discountable_gpus]
+                                        )
                                     )
                                     _candidate_indices, _candidate_fit = (
                                         self._select_gpus_split_aware(
@@ -19928,7 +20003,9 @@ class LlamaCppBackend:
                                     - _candidate_host_pinned_delta(
                                         [idx for idx, _free in _discountable_gpus]
                                     )
-                                    - _shared_pool_mmproj,
+                                    - _candidate_shared_pool_mmproj_delta(
+                                        [idx for idx, _free in _discountable_gpus]
+                                    ),
                                     _discountable_gpus,
                                     usable_fraction = _pin_fraction,
                                     total_by_idx = total_by_idx,
@@ -20151,30 +20228,7 @@ class LlamaCppBackend:
                     # unclassified memory. Once placement selects a discrete-only subset,
                     # adopt the host-pinned discount that the candidate-specific searches
                     # above already used.
-                    if (
-                        gpu_indices
-                        and not (set(gpu_indices) & (_shared_gpu_ids | _unclassified_gpu_ids))
-                        and (
-                            _host_pinned_candidate > _host_pinned
-                            or _draft_host_pinned_candidate > _draft_host_pinned
-                            or _shared_pool_mmproj > 0
-                        )
-                    ):
-                        _new_target_discount = _candidate_target_host_pinned_delta(gpu_indices)
-                        _candidate_draft_discount_applied = _candidate_draft_host_pinned_delta(
-                            gpu_indices
-                        )
-                        _host_pinned += _new_target_discount
-                        _draft_host_pinned += _candidate_draft_discount_applied
-                        _model_weight_vram_bytes = max(
-                            0, _model_weight_vram_bytes - _new_target_discount
-                        )
-                        model_size = max(0, model_size - _new_target_discount)
-                        model_size_fit = max(
-                            0,
-                            model_size_fit - _new_target_discount - _shared_pool_mmproj,
-                        )
-                        _shared_pool_mmproj = 0
+                    _apply_candidate_discounts(gpu_indices)
 
                     # Prefer fewer serving slots on GPU over --fit on offload: when the extra
                     # --parallel slots push the footprint past the pin budget, llama-server
@@ -20188,6 +20242,21 @@ class LlamaCppBackend:
                         and self._can_estimate_kv()
                         and effective_ctx > 0
                     ):
+                        # Once a candidate-specific discount is applied, keep the
+                        # slot search on that exact placement. Searching the full
+                        # mixed pool with the discounted footprint could switch to
+                        # shared or unclassified memory without restoring the bytes.
+                        _slot_gpus = gpus
+                        if (
+                            gpu_indices
+                            and (
+                                _candidate_target_discount_applied
+                                or _candidate_draft_discount_applied
+                                or _candidate_mmproj_discount_applied
+                            )
+                        ):
+                            _slot_ids = set(gpu_indices)
+                            _slot_gpus = [gpu for gpu in gpus if gpu[0] in _slot_ids]
                         # The PROBE context for the search below, not the context the load
                         # runs at: the re-fit further down awards that, from the final slot
                         # count. So price the search at the fit search floor, never at
@@ -20222,7 +20291,7 @@ class LlamaCppBackend:
                         _gi_slots, _uf_slots, _slots = self._slots_that_fit_on_gpu(
                             n_parallel,
                             _reduce_ctx,
-                            gpus,
+                            _slot_gpus,
                             total_by_idx,
                             _base_footprint,
                             cache_type_kv,
@@ -20336,7 +20405,9 @@ class LlamaCppBackend:
                             # re-select GPUs and load. Not a hardware maximum -- a larger
                             # request can reduce slots further and free KV for more.
                             _ceiling = (
-                                _refit if len(_plan_gpus) == len(gpus) else _largest_ctx(gpus)
+                                _refit
+                                if len(_plan_gpus) == len(_slot_gpus)
+                                else _largest_ctx(_slot_gpus)
                             )
                             if _ceiling is not None:
                                 # Replaces the anchor rather than raising it. Reaching here
@@ -20347,6 +20418,11 @@ class LlamaCppBackend:
                                 # the launched plan cannot serve, which is the same ceiling /
                                 # selection inversion #9492 removed, pointing the other way.
                                 max_available_ctx = _ceiling[0]
+
+                    # Slot reduction can make the first concrete selection. Adopt
+                    # its exact target/drafter/projector accounting before load-mode,
+                    # spill, and host-RAM checks consume the final placement.
+                    _apply_candidate_discounts(gpu_indices)
 
                     # Pass the final slot and micro-batch values instead of the defaults
                     # captured before slot reduction.
@@ -23125,6 +23201,10 @@ class LlamaCppBackend:
                     )
                     if _remaining:
                         _retry_wants_unified = self._amd_apu_wants_unified_memory(_remaining)
+                        _retry_discount_changes = _apply_candidate_discounts(_remaining)
+                        _retry_restored_discount = sum(
+                            max(0, -change) for change in _retry_discount_changes
+                        )
                         # Everything recorded so far priced the CRASHED selection, and
                         # that placement is gone: the canonical #7624 shape pins the APU
                         # whose shared-pool "free memory" outranked the dGPU, warns that
@@ -23169,11 +23249,12 @@ class LlamaCppBackend:
                                 self._record_load_warning(_retry_apu_msg)
                         # host guard credited the whole pool; the respawn reaches only _remaining
                         _retry_rows = [row for row in _detected_gpus if row[0] in set(_remaining)]
-                        # The crashed discrete placement may have spent its
-                        # host-pinned weight discount on a larger Auto context.
-                        # Those bytes return to the same pool when the retry lands
-                        # on an APU, so re-run the subset fit with the raw weight
-                        # footprint. This mirrors the original Auto policy: keep a
+                        # The crashed discrete placement may have spent target,
+                        # drafter, or CPU-projector discounts on a larger Auto
+                        # context. Those bytes return to the same pool when the retry
+                        # lands on an APU, and _apply_candidate_discounts above has
+                        # restored each term exactly once. Re-run the subset fit with
+                        # that raw footprint. This mirrors the original Auto policy: keep a
                         # fully-offloaded fitted context when one exists; otherwise
                         # fall back to the useful offload context and let llama.cpp's
                         # fitter place the load. A hand-set context remains the
@@ -23181,7 +23262,7 @@ class LlamaCppBackend:
                         if (
                             _retry_wants_unified
                             and not explicit_ctx
-                            and _host_pinned > 0
+                            and _retry_restored_discount > 0
                             and self._can_estimate_kv()
                             and effective_ctx > 0
                             and _retry_rows
@@ -23190,7 +23271,6 @@ class LlamaCppBackend:
                             _retry_budget_mib = _pool_budget_mib(_retry_rows, _pin_fraction)
                             _retry_model_size_fit = (
                                 model_size_fit
-                                + _host_pinned
                                 + max(0, _retry_n_gpus - 1) * _pipeline_overhead_bytes
                             )
                             _retry_cc = lambda c: _cc_bytes(c, _retry_n_gpus)
@@ -23242,9 +23322,9 @@ class LlamaCppBackend:
                                     self._max_context_length = _retry_ctx
                                     logger.info(
                                         "Arch-crash retry restored %.1f GB of "
-                                        "host-pinned weights on the APU; replanned "
+                                        "discrete-only budget relief on the APU; replanned "
                                         "Auto context to %d.",
-                                        _host_pinned / (1024**3),
+                                        _retry_restored_discount / (1024**3),
                                         _retry_ctx,
                                     )
                             if not _retry_fit_proved and fully_gpu_offloaded:

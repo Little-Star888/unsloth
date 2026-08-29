@@ -261,7 +261,8 @@ def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
     assert "env = os.environ" in src
     assert "shared_memory = False" in src
     assert "_host_pinned = 0 if _shared_memory else _host_pinned_candidate" in src
-    assert "set(gpu_indices) & (_shared_gpu_ids | _unclassified_gpu_ids)" in src
+    assert "_candidate_targets_proved_discrete" in src
+    assert "_shared_gpu_ids | _unclassified_gpu_ids" in src
 
 
 def test_a_draft_override_owns_only_the_drafter_discount(backend, tied_gguf):
