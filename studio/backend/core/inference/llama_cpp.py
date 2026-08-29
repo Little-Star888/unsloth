@@ -8180,13 +8180,10 @@ class LlamaCppBackend:
                 props = torch.cuda.get_device_properties(ordinal)
                 if is_rocm:
                     _arch, is_unified = rocm_classifier(props)
-                    if (
-                        not is_unified
-                        and (
-                            rocm_arch_overridden
-                            or (_arch or "").strip().lower()
-                            not in LlamaCppBackend._ROCM_PROVED_DISCRETE_ARCHS
-                        )
+                    if not is_unified and (
+                        rocm_arch_overridden
+                        or (_arch or "").strip().lower()
+                        not in LlamaCppBackend._ROCM_PROVED_DISCRETE_ARCHS
                     ):
                         # ROCm exposes no reliable negative signal: older wheels
                         # omit or zero is_integrated even for Phoenix gfx1103 APUs.

@@ -849,9 +849,7 @@ def test_a_dropped_drafter_clears_every_host_and_retry_ledger(tmp_path):
         ),
     )
     assert host_msg is None
-    final_cmd, note = backend._page_an_oversized_unmapped_load(
-        cmd, {}, lambda: bool(host_msg)
-    )
+    final_cmd, note = backend._page_an_oversized_unmapped_load(cmd, {}, lambda: bool(host_msg))
     assert final_cmd == cmd and note is None
 
 
