@@ -2778,9 +2778,7 @@ def test_gpu_ids_keeps_a_stripped_main_cpu_pin_out_of_the_drafter_budget(
     budgeted = []
     backend._resolve_launch_mtp_path = lambda **_kwargs: str(drafter)
     backend._host_pinned_vram_discount = lambda *_a, **_kw: 0
-    backend._separate_drafter_weight_vram_bytes = (
-        lambda path, _discount: budgeted.append(path) or 0
-    )
+    backend._separate_drafter_weight_vram_bytes = lambda path, _discount: budgeted.append(path) or 0
     backend._mtp_draft_kv_bytes = lambda *_a, **_kw: 0
     backend._select_gpus = lambda *_a, **_kw: ([0], False)
     backend.probe_server_capabilities = lambda _binary = None: {
@@ -2811,9 +2809,7 @@ def test_gpu_ids_keeps_a_stripped_main_cpu_pin_out_of_the_drafter_budget(
     [["--spec-draft-device", "cpu"], ["--gpu-layers-draft", "0"]],
     ids = ["device", "layers"],
 )
-def test_gpu_ids_preserves_an_explicit_cpu_drafter_in_the_budget(
-    tmp_path, draft_cpu_args
-):
+def test_gpu_ids_preserves_an_explicit_cpu_drafter_in_the_budget(tmp_path, draft_cpu_args):
     """The explicit GPU selection only owns main-device placement; a draft CPU
     pin still removes the separate drafter from VRAM and survives to the child."""
     backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 24_000, 24_000)])
@@ -2822,9 +2818,7 @@ def test_gpu_ids_preserves_an_explicit_cpu_drafter_in_the_budget(
     budgeted = []
     backend._resolve_launch_mtp_path = lambda **_kwargs: str(drafter)
     backend._host_pinned_vram_discount = lambda *_a, **_kw: 0
-    backend._separate_drafter_weight_vram_bytes = (
-        lambda path, _discount: budgeted.append(path) or 0
-    )
+    backend._separate_drafter_weight_vram_bytes = lambda path, _discount: budgeted.append(path) or 0
     backend._select_gpus = lambda *_a, **_kw: ([0], False)
     backend.probe_server_capabilities = lambda _binary = None: {
         "mtp_token": "draft-mtp",
