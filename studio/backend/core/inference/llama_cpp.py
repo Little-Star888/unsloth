@@ -18196,11 +18196,9 @@ class LlamaCppBackend:
                                 for name in str(_pass_through_device).split(",")
                                 if name.strip()
                             }
-                            if (
-                                not is_vulkan_backend
-                                or _named_devices
-                                != {f"vulkan{idx}" for idx in _candidate_ids}
-                            ):
+                            if not is_vulkan_backend or _named_devices != {
+                                f"vulkan{idx}" for idx in _candidate_ids
+                            }:
                                 return 0
                         return _host_pinned_candidate - _host_pinned
 
