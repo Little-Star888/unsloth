@@ -1204,7 +1204,12 @@ def test_an_unseen_pin_with_a_concrete_layer_count_still_stands_down(tmp_path):
     assert backend.spec_fallback_reason == "mtp_partial_offload"
 
 
-def _tight_vram_backend(tmp_path: Path, *, drafter_gb: float, vulkan: bool = False):
+def _tight_vram_backend(
+    tmp_path: Path,
+    *,
+    drafter_gb: float,
+    vulkan: bool = False,
+):
     """One 24 GB card, a 16 GB target and a drafter of the caller's size.
 
     The fit terms are stubbed to constants so the only variable is whether the
@@ -2406,7 +2411,11 @@ def test_a_cpu_drafter_is_included_in_the_normal_host_guard(tmp_path, monkeypatc
     backend._get_gguf_size_bytes = lambda _path: 8 * gib
     draft_fit_paths = []
 
-    def _draft_fit(*_a, drafter_path = None, **_kw):
+    def _draft_fit(
+        *_a,
+        drafter_path = None,
+        **_kw,
+    ):
         draft_fit_paths.append(drafter_path)
         return 8 * gib if drafter_path else 0
 
@@ -3655,9 +3664,7 @@ def test_a_cpu_replay_does_not_charge_an_auto_dropped_drafter(tmp_path, monkeypa
             "is_igpu": False,
         }
     ]
-    backend._get_gpu_free_memory_vulkan = lambda _binary = None, **_kw: [
-        (0, 24_576, 24_576)
-    ]
+    backend._get_gpu_free_memory_vulkan = lambda _binary = None, **_kw: [(0, 24_576, 24_576)]
     backend._vulkan_rows_target_igpus = lambda *_a, **_kw: False
     backend._vulkan_auto_gpu_memory = lambda rows: list(rows)
     backend._cpu_isolated_binary = lambda _binary: "/fake/llama-server"

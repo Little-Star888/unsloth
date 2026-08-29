@@ -22226,9 +22226,7 @@ class LlamaCppBackend:
                     avail_mib = _preflight_avail_mib,
                     shared_gpu_ids = _shared_gpu_ids,
                     host_only_bytes = _host_pinned,
-                    additional_host_only_bytes = (
-                        (_cpu_draft_fit_bytes or 0) + _draft_host_pinned
-                    ),
+                    additional_host_only_bytes = ((_cpu_draft_fit_bytes or 0) + _draft_host_pinned),
                 )
                 # Snapshotted BEFORE the override note is appended below, so a re-price
                 # that promotes this notice appends that note once rather than twice.
