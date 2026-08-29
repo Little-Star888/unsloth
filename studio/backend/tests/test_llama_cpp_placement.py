@@ -335,11 +335,12 @@ def test_pass_through_vulkan_pin_cancels_the_candidate_host_discount(tmp_path):
 
     (automatic_size, automatic_host), _cmd = planned_size()
     (restated_size, restated_host), _cmd = planned_size(["--device", "Vulkan0"])
+    (mixed_size, mixed_host), _cmd = planned_size(["--device", "Vulkan0,Vulkan1"])
     (pinned_size, pinned_host), cmd = planned_size(["--device", "Vulkan1"])
 
     assert restated_size == automatic_size
-    assert pinned_size == automatic_size + 100
-    assert (automatic_host, restated_host, pinned_host) == (100, 100, 0)
+    assert mixed_size == pinned_size == automatic_size + 100
+    assert (automatic_host, restated_host, mixed_host, pinned_host) == (100, 100, 0, 0)
     assert cmd[-2:] == ["--device", "Vulkan1"]
 
 
@@ -2395,6 +2396,52 @@ def test_host_pinned_weights_keep_an_unmapped_load_from_spending_surplus_vram(
     )
 
     cmd = _launch(backend, gguf, extra_args = ["--no-mmap"])["cmd"]
+
+    assert not _unmapped_tokens(cmd), cmd
+    assert "does not fit in GPU memory" in (backend.last_load_warning or "")
+    assert "memory mapping instead" in (backend.last_load_warning or "")
+
+
+def test_a_mixed_vulkan_pin_preserves_the_physical_host_embedding_floor(
+    tmp_path, monkeypatch
+):
+    """A trailing mixed-device override cancels the discrete-only VRAM discount,
+    but surplus dGPU memory still cannot hold embeddings pinned in system RAM."""
+    gib = 1024**3
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [],
+    )
+    backend._run_vulkan_probe = lambda *_a, **_kw: [
+        {
+            "index": 0,
+            "free_mib": 12_000,
+            "total_mib": 16_000,
+            "is_igpu": False,
+            "name": "Vulkan0",
+        },
+        {
+            "index": 1,
+            "free_mib": 1_000,
+            "total_mib": 0,
+            "is_igpu": True,
+            "name": "Vulkan1",
+        },
+    ]
+    _restore_host_guard(backend)
+    backend._get_gguf_size_bytes = lambda _path: 13 * gib
+    backend._host_pinned_vram_discount = lambda *_a, **_kw: 8 * gib
+    backend._select_gpus = lambda *_a, **_kw: ([0], False)
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 9_000)
+    )
+
+    cmd = _launch(
+        backend,
+        gguf,
+        extra_args = ["--device", "Vulkan0,Vulkan1", "--no-mmap"],
+    )["cmd"]
 
     assert not _unmapped_tokens(cmd), cmd
     assert "does not fit in GPU memory" in (backend.last_load_warning or "")

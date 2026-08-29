@@ -18062,6 +18062,11 @@ class LlamaCppBackend:
                 # embedding floor, distinct from a whole CPU-offloaded drafter.
                 _host_pinned = 0
                 _draft_host_pinned = 0
+                # Physical host-only floors are not the same ledger as the VRAM
+                # discounts above. A mixed shared+discrete placement may receive no
+                # discount while its embeddings still cannot move out of system RAM.
+                _host_pinned_floor = 0
+                _draft_host_pinned_floor = 0
                 _draft_host_pinned_candidate = 0
                 _mtp_draft_weights_candidate = 0
                 _candidate_target_discount_applied = 0
@@ -18172,6 +18177,7 @@ class LlamaCppBackend:
                         env = os.environ,
                         shared_memory = False,
                     )
+                    _host_pinned_floor = _host_pinned_candidate
                     _host_pinned = 0 if _shared_memory else _host_pinned_candidate
                     _model_weight_vram_bytes = max(
                         0, gguf_size + self._tied_output_bytes(model_path) - _host_pinned
@@ -18618,6 +18624,7 @@ class LlamaCppBackend:
                                 shared_memory = False,
                                 draft_model = True,
                             )
+                            _draft_host_pinned_floor = _draft_host_pinned_candidate
                             _draft_host_pinned = (
                                 0 if _shared_memory else _draft_host_pinned_candidate
                             )
@@ -18631,6 +18638,7 @@ class LlamaCppBackend:
                             )
                         except Exception:
                             _draft_host_pinned = 0
+                            _draft_host_pinned_floor = 0
                             _draft_host_pinned_candidate = 0
                             _mtp_draft_weights = 0
                             _mtp_draft_weights_candidate = 0
@@ -19466,6 +19474,7 @@ class LlamaCppBackend:
                             # its GPU placement's host-pinned floor nor a prospective
                             # CPU replay may retain bytes for it.
                             _draft_host_pinned = 0
+                            _draft_host_pinned_floor = 0
                             _draft_host_pinned_candidate = 0
                             _mtp_draft_weights = 0
                             _mtp_draft_weights_candidate = 0
@@ -22445,8 +22454,10 @@ class LlamaCppBackend:
                     child_has_no_gpu = _child_has_no_gpu,
                     avail_mib = _preflight_avail_mib,
                     shared_gpu_ids = _shared_gpu_ids,
-                    host_only_bytes = _host_pinned,
-                    additional_host_only_bytes = ((_cpu_draft_fit_bytes or 0) + _draft_host_pinned),
+                    host_only_bytes = _host_pinned_floor,
+                    additional_host_only_bytes = (
+                        (_cpu_draft_fit_bytes or 0) + _draft_host_pinned_floor
+                    ),
                 )
                 # Snapshotted BEFORE the override note is appended below, so a re-price
                 # that promotes this notice appends that note once rather than twice.
@@ -22476,9 +22487,9 @@ class LlamaCppBackend:
                             env,
                             child_has_no_gpu = _child_has_no_gpu,
                             shared_gpu_ids = _shared_gpu_ids,
-                            host_only_bytes = _host_pinned,
+                            host_only_bytes = _host_pinned_floor,
                             additional_host_only_bytes = (
-                                (_cpu_draft_fit_bytes or 0) + _draft_host_pinned
+                                (_cpu_draft_fit_bytes or 0) + _draft_host_pinned_floor
                             ),
                             honor_opt_out = False,
                         )
@@ -23357,9 +23368,9 @@ class LlamaCppBackend:
                             cmd,
                             _retry_rows,
                             env,
-                            host_only_bytes = _host_pinned,
+                            host_only_bytes = _host_pinned_floor,
                             additional_host_only_bytes = (
-                                (_cpu_draft_fit_bytes or 0) + _draft_host_pinned
+                                (_cpu_draft_fit_bytes or 0) + _draft_host_pinned_floor
                             ),
                         )
                         _host_ram_msg = _retry_host_msg
@@ -23547,9 +23558,9 @@ class LlamaCppBackend:
                                     cmd,
                                     _retry_rows,
                                     env,
-                                    host_only_bytes = _host_pinned,
+                                    host_only_bytes = _host_pinned_floor,
                                     additional_host_only_bytes = (
-                                        (_cpu_draft_fit_bytes or 0) + _draft_host_pinned
+                                        (_cpu_draft_fit_bytes or 0) + _draft_host_pinned_floor
                                     ),
                                     honor_opt_out = False,
                                 )
