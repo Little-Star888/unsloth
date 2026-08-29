@@ -4632,6 +4632,26 @@ def _extra_args_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optiona
     return last_dev
 
 
+def _extra_args_effective_draft_device_pin(
+    extra_args: Optional[Iterable[str]],
+) -> Optional[str]:
+    """Return the GPU device selection the separate drafter will inherit.
+
+    An explicit draft-device value owns the drafter, including cpu/none. Without
+    one, load_model copies the main device selection into the generated draft
+    flags, so budgeting must honor that same last-wins placement.
+    """
+    if _extra_args_draft_device(extra_args) is not None:
+        return _extra_args_draft_device_pin(extra_args)
+    main_dev = _extra_args_main_device(extra_args)
+    if main_dev is None:
+        return None
+    devs = [d.strip() for d in main_dev.split(",") if d.strip()]
+    if not devs or all(d.lower() in _CPU_DEVICE_VALUES for d in devs):
+        return None
+    return main_dev
+
+
 def _emitted_n_batch(n_batch: Optional[int], n_parallel: int) -> Optional[int]:
     """--batch-size the launch actually emits for a requested ``n_batch``.
 
@@ -8000,6 +8020,7 @@ class LlamaCppBackend:
             "gfx908",
             "gfx90a",
             "gfx942",
+            "gfx950",
             "gfx1100",
             "gfx1101",
             "gfx1102",
@@ -18621,7 +18642,7 @@ class LlamaCppBackend:
                             or (_candidate_ids & (_shared_gpu_ids | _unclassified_gpu_ids))
                         ):
                             return 0
-                        _draft_pin = _extra_args_draft_device_pin(extra_args)
+                        _draft_pin = _extra_args_effective_draft_device_pin(extra_args)
                         if _draft_pin is not None:
                             _draft_devices = {
                                 name.strip().lower()

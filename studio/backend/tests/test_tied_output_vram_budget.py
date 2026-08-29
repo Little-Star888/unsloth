@@ -404,7 +404,9 @@ def test_an_unclassified_rocm_arch_is_not_proved_discrete(backend, monkeypatch):
     assert backend._torch_unified_memory_classification_known([0]) is False
 
 
-@pytest.mark.parametrize("arch", ["gfx906", "gfx908", "gfx90a", "gfx942", "gfx1031", "gfx1100"])
+@pytest.mark.parametrize(
+    "arch", ["gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1031", "gfx1100"]
+)
 def test_a_known_discrete_rocm_arch_is_proved_discrete(backend, monkeypatch, arch):
     class _Props:
         gcnArchName = arch
