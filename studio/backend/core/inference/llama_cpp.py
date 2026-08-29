@@ -20857,9 +20857,9 @@ class LlamaCppBackend:
                         _spill_inputs["extra_gpu_bytes"] = (
                             mmproj_size + _shared_pool_mmproj + _mtp_reserve_bytes
                         )
-                        _spill_inputs["shared_gpu_ids"] = set(
-                            _shared_gpu_ids or ()
-                        ) & set(gpu_indices)
+                        _spill_inputs["shared_gpu_ids"] = set(_shared_gpu_ids or ()) & set(
+                            gpu_indices
+                        )
 
                 # Status reports the explicit subset the launch actually uses,
                 # while reload dedupe compares requested_gpu_ids so repeating a
