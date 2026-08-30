@@ -4514,8 +4514,8 @@ def _extra_args_draft_offloaded_to_cpu(
 ) -> bool:
     """True if the SEPARATE draft model is on CPU (so the budget must not charge
     its weights+KV): --spec-draft-ngl 0, a draft device naming only cpu/none, or
-    an inherited main CPU device when no draft-specific device overrides it; else
-    the LLAMA_ARG_N_GPU_LAYERS_DRAFT env the child honors (device flags have no env).
+    a main CPU device Studio copies into its generated draft flags; else the
+    LLAMA_ARG_N_GPU_LAYERS_DRAFT env the child honors (device flags have no env).
     An embedded MTP head follows the main -ngl, so these draft-only flags don't move
     it. Last-wins, so only each flag's final value counts.
 
@@ -4529,7 +4529,7 @@ def _extra_args_draft_offloaded_to_cpu(
         except (TypeError, ValueError):
             pass
     last_dev = _extra_args_draft_device(extra_args)
-    if last_dev is None:
+    if last_dev is None and not _extra_args_set_spec_type(extra_args):
         last_dev = _extra_args_main_device(extra_args)
     if last_dev is not None:
         devs = [d.strip().lower() for d in last_dev.split(",") if d.strip()]
@@ -4645,12 +4645,15 @@ def _extra_args_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optiona
 def _extra_args_effective_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optional[str]:
     """Return the GPU device selection the separate drafter will inherit.
 
-    An explicit draft-device value owns the drafter, including cpu/none. Without
-    one, load_model copies the main device selection into the generated draft
-    flags, so budgeting must honor that same last-wins placement.
+    An explicit draft-device value owns the drafter, including cpu/none. When
+    Studio owns the speculative block, load_model copies the main device selection
+    into the generated draft flags, so budgeting must honor that placement. A
+    user-owned --spec-type emits no generated flag and therefore inherits nothing.
     """
     if _extra_args_draft_device(extra_args) is not None:
         return _extra_args_draft_device_pin(extra_args)
+    if _extra_args_set_spec_type(extra_args):
+        return None
     main_dev = _extra_args_main_device(extra_args)
     if main_dev is None:
         return None
@@ -7311,59 +7314,43 @@ class LlamaCppBackend:
         shard; unreadable or incomplete models return 0 to preserve the previous
         conservative budget.
         """
-        try:
-            paths = LlamaCppBackend._gguf_shard_paths(model_path)
-            stats = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
-        except OSError:
+        identity = LlamaCppBackend._gguf_load_source_identity(model_path)
+        if identity is None:
             return 0
-        return LlamaCppBackend._host_pinned_weight_bytes_cached(stats)
+        return LlamaCppBackend._host_pinned_weight_bytes_cached(identity)
 
     @staticmethod
     @functools.lru_cache(maxsize = 64)
-    def _host_pinned_weight_bytes_cached(stats: tuple) -> int:
+    def _host_pinned_weight_bytes_cached(identity: tuple) -> int:
         try:
-            from gguf import GGUFReader
-
-            total = 0
-            for path, _size, _mtime in stats:
-                for tensor in GGUFReader(path).tensors:
-                    name = str(tensor.name)
-                    if name == "token_embd.weight" or name.startswith("per_layer_token_embd"):
-                        total += int(tensor.n_bytes)
-            return total
+            return sum(
+                size
+                for entry in identity
+                for _name, size in LlamaCppBackend._gguf_scan_host_pinned_tensors(entry[0])
+            )
         except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
-            logger.debug("host-pinned probe failed for %s (%s)", stats and stats[0][0], exc)
+            logger.debug("host-pinned probe failed for %s (%s)", identity, exc)
             return 0
 
     @staticmethod
     def _host_pinned_weight_items(model_path: str) -> "tuple[tuple[str, int], ...]":
         """Concrete host-pinned tensor names and bytes, or empty when unreadable."""
-        try:
-            paths = LlamaCppBackend._gguf_shard_paths(model_path)
-            stats = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
-        except OSError:
+        identity = LlamaCppBackend._gguf_load_source_identity(model_path)
+        if identity is None:
             return ()
-        return LlamaCppBackend._host_pinned_weight_items_cached(stats)
+        return LlamaCppBackend._host_pinned_weight_items_cached(identity)
 
     @staticmethod
     @functools.lru_cache(maxsize = 64)
-    def _host_pinned_weight_items_cached(stats: tuple) -> "tuple[tuple[str, int], ...]":
+    def _host_pinned_weight_items_cached(identity: tuple) -> "tuple[tuple[str, int], ...]":
         try:
-            from gguf import GGUFReader
-
-            items = []
-            for path, _size, _mtime in stats:
-                for tensor in GGUFReader(path).tensors:
-                    name = str(tensor.name)
-                    if name == "token_embd.weight" or name.startswith("per_layer_token_embd"):
-                        items.append((name, int(tensor.n_bytes)))
-            return tuple(items)
-        except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
-            logger.debug(
-                "host-pinned item probe failed for %s (%s)",
-                stats and stats[0][0],
-                exc,
+            return tuple(
+                item
+                for entry in identity
+                for item in LlamaCppBackend._gguf_scan_host_pinned_tensors(entry[0])
             )
+        except Exception as exc:  # noqa: BLE001 - budget must not fail a launch
+            logger.debug("host-pinned item probe failed for %s (%s)", identity, exc)
             return ()
 
     @staticmethod
@@ -7661,6 +7648,54 @@ class LlamaCppBackend:
                 data_start = -(-f.tell() // alignment) * alignment
                 token_embd_bytes = max(0, os.path.getsize(path) - data_start - unsized_at)
         return architecture, False, token_embd_bytes
+
+    @staticmethod
+    def _gguf_scan_host_pinned_tensors(path: str) -> "tuple[tuple[str, int], ...]":
+        """Host-pinned embedding names and stored bytes from one GGUF header."""
+        from gguf.constants import GGML_QUANT_SIZES
+
+        alignment = 32
+        items: list[tuple[str, int]] = []
+        unsized: Optional[tuple[str, int]] = None
+        with open(path, "rb") as f:
+            if struct.unpack("<I", f.read(4))[0] != 0x46554747:
+                return ()
+            f.seek(4, 1)
+            n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+            for _ in range(n_kv):
+                key = f.read(struct.unpack("<Q", f.read(8))[0])
+                value_type = struct.unpack("<I", f.read(4))[0]
+                if key == b"general.alignment" and value_type == 4:
+                    alignment = max(1, struct.unpack("<I", f.read(4))[0])
+                    continue
+                LlamaCppBackend._gguf_skip_value(f, value_type)
+            for _ in range(n_tensors):
+                raw_name = f.read(struct.unpack("<Q", f.read(8))[0])
+                n_dims = struct.unpack("<I", f.read(4))[0]
+                dims = struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims))
+                ggml_type = struct.unpack("<I", f.read(4))[0]
+                offset = struct.unpack("<Q", f.read(8))[0]
+                if unsized is not None:
+                    items.append((unsized[0], offset - unsized[1]))
+                    unsized = None
+                if raw_name == b"token_embd.weight" or raw_name.startswith(
+                    b"per_layer_token_embd"
+                ):
+                    name = raw_name.decode("utf-8", "replace")
+                    block = GGML_QUANT_SIZES.get(ggml_type)
+                    if block is None:
+                        unsized = (name, offset)
+                    else:
+                        items.append((name, math.prod(dims) // block[0] * block[1]))
+            if unsized is not None:
+                data_start = -(-f.tell() // alignment) * alignment
+                items.append(
+                    (
+                        unsized[0],
+                        max(0, os.path.getsize(path) - data_start - unsized[1]),
+                    )
+                )
+        return tuple(items)
 
     @staticmethod
     def _installed_ggml_backends(binary: Optional[str] = None) -> frozenset[str]:

@@ -364,7 +364,13 @@ def test_the_probe_reads_the_header_without_building_a_gguf_reader(backend, tied
     gguf.GGUFReader = explode
     try:
         backend._tied_output_bytes_cached.cache_clear()
+        backend._host_pinned_weight_bytes_cached.cache_clear()
+        backend._host_pinned_weight_items_cached.cache_clear()
         assert backend._tied_output_bytes(str(tied_gguf)) == 8 * 64 * 4
+        assert backend._host_pinned_weight_bytes(str(tied_gguf)) == 8 * 64 * 4
+        assert backend._host_pinned_weight_items(str(tied_gguf)) == (
+            ("token_embd.weight", 8 * 64 * 4),
+        )
     finally:
         gguf.GGUFReader = original
 
@@ -395,6 +401,48 @@ def test_the_probe_cache_is_keyed_on_the_inode_not_the_path_size_and_mtime(backe
     assert after.st_ino != before.st_ino
 
     assert backend._tied_output_bytes(str(path)) == 8 * 64 * 4
+
+
+def test_the_host_pinned_cache_is_keyed_on_file_identity(backend, tmp_path):
+    path = tmp_path / "host-swapped.gguf"
+    _write_gguf(path, [("token_embd.weight", (8, 64))])
+    assert backend._host_pinned_weight_bytes(str(path)) == 8 * 64 * 4
+
+    before = path.stat()
+    replacement = tmp_path / "host-replacement.gguf"
+    _write_gguf(replacement, [("token_embd.weight", (8, 16))])
+    pad = before.st_size - replacement.stat().st_size
+    assert pad >= 0
+    _write_gguf(replacement, [("token_embd.weight", (8, 16))], pad = pad)
+    os.utime(replacement, ns = (before.st_atime_ns, before.st_mtime_ns))
+    os.replace(replacement, path)
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert after.st_ino != before.st_ino
+
+    assert backend._host_pinned_weight_bytes(str(path)) == 8 * 16 * 4
+    assert backend._host_pinned_weight_items(str(path)) == (
+        ("token_embd.weight", 8 * 16 * 4),
+    )
+
+
+def test_advanced_spec_drafter_does_not_inherit_the_main_cpu_device():
+    from core.inference import llama_cpp
+
+    advanced = [
+        "--spec-type",
+        "draft-simple",
+        "--model-draft",
+        "draft.gguf",
+        "--device",
+        "none",
+    ]
+    assert llama_cpp._extra_args_draft_device(advanced) is None
+    assert llama_cpp._extra_args_draft_offloaded_to_cpu(advanced, {}) is False
+    assert llama_cpp._extra_args_effective_draft_device_pin(advanced) is None
+
+    generated = ["--model-draft", "draft.gguf", "--device", "none"]
+    assert llama_cpp._extra_args_draft_offloaded_to_cpu(generated, {}) is True
 
 
 def test_the_budget_sizes_from_what_lands_in_vram(backend, tied_gguf):
