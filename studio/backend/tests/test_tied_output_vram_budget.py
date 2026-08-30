@@ -421,9 +421,7 @@ def test_the_host_pinned_cache_is_keyed_on_file_identity(backend, tmp_path):
     assert after.st_ino != before.st_ino
 
     assert backend._host_pinned_weight_bytes(str(path)) == 8 * 16 * 4
-    assert backend._host_pinned_weight_items(str(path)) == (
-        ("token_embd.weight", 8 * 16 * 4),
-    )
+    assert backend._host_pinned_weight_items(str(path)) == (("token_embd.weight", 8 * 16 * 4),)
 
 
 def test_advanced_spec_drafter_does_not_inherit_the_main_cpu_device():

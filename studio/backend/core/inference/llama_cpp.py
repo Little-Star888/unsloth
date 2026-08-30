@@ -7678,9 +7678,7 @@ class LlamaCppBackend:
                 if unsized is not None:
                     items.append((unsized[0], offset - unsized[1]))
                     unsized = None
-                if raw_name == b"token_embd.weight" or raw_name.startswith(
-                    b"per_layer_token_embd"
-                ):
+                if raw_name == b"token_embd.weight" or raw_name.startswith(b"per_layer_token_embd"):
                     name = raw_name.decode("utf-8", "replace")
                     block = GGML_QUANT_SIZES.get(ggml_type)
                     if block is None:
