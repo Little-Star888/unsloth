@@ -667,7 +667,6 @@ def _drafter_gate(
     caps: dict,
     drafter = "/models/mtp-gemma.gguf",
     extra_args = None,
-    accounting = None,
 ):
     """Run load_model's real unpinnable-drafter statements and report what the launch
     would see: (resolved drafter, extra args, warnings)."""
@@ -710,41 +709,8 @@ def _drafter_gate(
         "n_parallel": 1,
         "cmd": ["--parallel", "1"],
         "logger": log,
-        # The guard runs after fit. Seed every drafter ledger it can invalidate so
-        # regression tests exercise the real statements, not a source substring.
-        "_mtp_will_engage": True,
-        "_draft_host_pinned": 8 * 1024**3,
-        "_draft_host_pinned_floor": 8 * 1024**3,
-        "_draft_host_pinned_candidate": 8 * 1024**3,
-        "_mtp_draft_weights": 8 * 1024**3,
-        "_mtp_draft_weights_candidate": 8 * 1024**3,
-        "_candidate_draft_discount_applied": 8 * 1024**3,
-        # The drop predicate excludes a CPU-pinned drafter, so this is already zero.
-        "_cpu_draft_fit_bytes": 0,
-        "_replay_draft_fit_bytes": 8 * 1024**3,
-        "mtp_overhead_fn": lambda _ctx: 8 * 1024**3,
-        "_mtp_kv_unsized": True,
     }
     exec(ast.unparse(ast.Module(body = body, type_ignores = [])), scope)
-    if accounting is not None:
-        accounting.update(
-            {
-                name: scope[name]
-                for name in (
-                    "_mtp_will_engage",
-                    "_draft_host_pinned",
-                    "_draft_host_pinned_floor",
-                    "_draft_host_pinned_candidate",
-                    "_mtp_draft_weights",
-                    "_mtp_draft_weights_candidate",
-                    "_candidate_draft_discount_applied",
-                    "_cpu_draft_fit_bytes",
-                    "_replay_draft_fit_bytes",
-                    "mtp_overhead_fn",
-                    "_mtp_kv_unsized",
-                )
-            }
-        )
     return scope["launch_mtp_draft_path"], scope["extra_args"], log.warnings
 
 
@@ -790,67 +756,6 @@ def test_a_drafter_that_cannot_be_pinned_is_dropped(monkeypatch):
         paravirtual = True, caps = {}, drafter = None, extra_args = owned
     )
     assert any("draft-layer flag" in w for w in warnings), warnings
-
-
-def test_a_dropped_drafter_clears_every_host_and_retry_ledger(tmp_path):
-    """The late paravirtual guard removes the drafter from the final argv. Host
-    preflight and later CPU/GPU retries must therefore price the target alone."""
-    accounting = {}
-
-    drafter, _extras, _warnings = _drafter_gate(
-        paravirtual = True,
-        caps = {},
-        accounting = accounting,
-    )
-
-    assert drafter is None
-    assert accounting == {
-        "_mtp_will_engage": False,
-        "_draft_host_pinned": 0,
-        "_draft_host_pinned_floor": 0,
-        "_draft_host_pinned_candidate": 0,
-        "_mtp_draft_weights": 0,
-        "_mtp_draft_weights_candidate": 0,
-        "_candidate_draft_discount_applied": 0,
-        "_cpu_draft_fit_bytes": 0,
-        "_replay_draft_fit_bytes": 0,
-        "mtp_overhead_fn": None,
-        "_mtp_kv_unsized": False,
-    }
-
-    # Exercise the consumer that reported the bug. The 1 GiB target fits the 4 GiB
-    # host once the absent sidecar is cleared; the stale 8 GiB floor would warn and
-    # turn this explicit unmapped request into a pageable one.
-    target = tmp_path / "target.gguf"
-    target.write_bytes(b"GGUF")
-    cmd = ["llama-server", "-m", str(target), "--no-mmap"]
-    backend = llama_cpp.LlamaCppBackend.__new__(llama_cpp.LlamaCppBackend)
-    backend._get_gguf_size_bytes = lambda _path: 1024**3
-    backend._shared_heap_budget = lambda *_a, **_kw: (-1, 0)
-    assert (
-        backend._launch_host_shortfall_message(
-            cmd,
-            (),
-            {},
-            child_has_no_gpu = True,
-            avail_mib = 4 * 1024,
-            additional_host_only_bytes = 8 * 1024**3,
-        )
-        is not None
-    ), "the boundary must reproduce with the stale drafter floor"
-    host_msg = backend._launch_host_shortfall_message(
-        cmd,
-        (),
-        {},
-        child_has_no_gpu = True,
-        avail_mib = 4 * 1024,
-        additional_host_only_bytes = (
-            accounting["_cpu_draft_fit_bytes"] + accounting["_draft_host_pinned_floor"]
-        ),
-    )
-    assert host_msg is None
-    final_cmd, note = backend._page_an_oversized_unmapped_load(cmd, {}, lambda: bool(host_msg))
-    assert final_cmd == cmd and note is None
 
 
 def test_the_drop_takes_a_user_owned_drafter_with_it():

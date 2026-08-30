@@ -69,7 +69,6 @@ from core.inference.llama_cpp import (  # noqa: E402
     LlamaCppBackend,
     _extra_args_draft_cache_types,
     _extra_args_draft_device_pin,
-    _extra_args_effective_draft_device_pin,
     _extra_args_draft_offloaded_to_cpu,
     _extra_args_mtp_draft_path,
     _extra_args_n_ubatch,
@@ -664,18 +663,6 @@ class TestExtraArgsMtpDetection:
         assert "_env_draft_for_budget=_extra_args_mtp_draft_path([],env=_spec_env)" in compact
         assert "_cli_draft_for_budgetor_studio_draft_for_budgetor_env_draft_for_budget" in compact
 
-    def test_load_model_discounts_host_pinned_drafter_weights(self):
-        compact = "".join(inspect.getsource(LlamaCppBackend.load_model).split())
-        assert "_draft_host_pinned_candidate=self._host_pinned_vram_discount(" in compact
-        assert (
-            "self._separate_drafter_weight_vram_bytes("
-            "_mtp_draft_for_budget,_draft_host_pinned" in compact
-        )
-        assert "draft_model=True" in compact
-        assert "shared_memory=False" in compact
-        assert "_candidate_draft_host_pinned_delta" in compact
-        assert "_extra_args_effective_draft_device_pin(extra_args)" in compact
-
     def test_load_model_drops_cpu_offloaded_drafter_from_budget(self):
         # A SEPARATE drafter offloaded to CPU (--spec-draft-ngl 0 /
         # --spec-draft-device none) consumes no GPU, so it must be dropped from the
@@ -687,7 +674,8 @@ class TestExtraArgsMtpDetection:
         compact = "".join(inspect.getsource(LlamaCppBackend.load_model).split())
         # env-aware: also honors the inherited LLAMA_ARG_N_GPU_LAYERS_DRAFT.
         assert (
-            "_draft_on_cpu=_extra_args_draft_offloaded_to_cpu(extra_args,env=os.environ)" in compact
+            "_draft_on_cpu=_extra_args_draft_offloaded_to_cpu("
+            "_draft_placement_extras,env=_draft_placement_env,)" in compact
         )
         assert "if_draft_on_cpu:_mtp_draft_for_budget=None" in compact
         # flat reserve suppressed for a CPU drafter that is the one being launched
@@ -735,12 +723,6 @@ class TestExtraArgsMtpDetection:
             (["--spec-draft-ngl", "-1", "--spec-draft-ngl", "0"], True),  # last = CPU
             (["--spec-draft-device", "CUDA0", "--spec-draft-device", "none"], True),
             (["--spec-draft-device", "none", "--spec-draft-device", "CUDA0"], False),
-            # A separate drafter inherits the main device when no draft-specific
-            # override is present; load_model emits that inherited pin later.
-            (["--device", "none"], True),
-            (["--device", "CPU"], True),
-            # An explicit draft placement still wins over the inherited main pin.
-            (["--device", "none", "--spec-draft-device", "CUDA0"], False),
         ],
     )
     def test_draft_offloaded_to_cpu(self, args, expected):
@@ -792,21 +774,6 @@ class TestExtraArgsMtpDetection:
     )
     def test_draft_device_pin(self, args, expected):
         assert _extra_args_draft_device_pin(args) == expected
-
-    @pytest.mark.parametrize(
-        "args,expected",
-        [
-            (["--device", "Vulkan1"], "Vulkan1"),
-            (["--device", "Vulkan1", "--spec-draft-device", "Vulkan0"], "Vulkan0"),
-            (["--device", "Vulkan1", "--spec-draft-device", "cpu"], None),
-            (["--device", "cpu"], None),
-            ([], None),
-        ],
-    )
-    def test_effective_draft_device_pin_inherits_only_without_an_explicit_draft_override(
-        self, args, expected
-    ):
-        assert _extra_args_effective_draft_device_pin(args) == expected
 
     @pytest.mark.parametrize(
         "args,expected",

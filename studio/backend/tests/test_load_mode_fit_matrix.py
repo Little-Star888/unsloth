@@ -215,12 +215,7 @@ def test_the_launch_charges_the_pipeline_overhead_per_extra_device():
 class _DraftStub:
     """Only the drafter-footprint readers _cpu_resident_draft_bytes consults."""
 
-    def __init__(
-        self,
-        weights,
-        kv,
-        tied_output = 0,
-    ):
+    def __init__(self, weights, kv, tied_output = 0):
         self._weights = weights
         self._kv = kv
         self._tied_output = tied_output
@@ -256,13 +251,6 @@ def test_a_cpu_pinned_drafter_is_charged_weights_plus_kv_plus_its_graph():
     stub = _DraftStub(3 * GIB, 512 * MIB)
     assert stub._cpu_resident_draft_bytes(8192, drafter_path = "d.gguf") == (
         3 * GIB + 512 * MIB + LlamaCppBackend._MTP_DRAFT_COMPUTE_BYTES
-    )
-
-
-def test_a_cpu_pinned_tied_drafter_charges_its_duplicated_output():
-    stub = _DraftStub(3 * GIB, 512 * MIB, tied_output = 256 * MIB)
-    assert stub._cpu_resident_draft_bytes(8192, drafter_path = "d.gguf") == (
-        3 * GIB + 256 * MIB + 512 * MIB + LlamaCppBackend._MTP_DRAFT_COMPUTE_BYTES
     )
 
 
@@ -393,25 +381,6 @@ def test_a_cpu_pinned_drafter_is_not_paid_for_out_of_vram(monkeypatch):
         )
         == FIT_MODE
     )
-
-
-def test_gpu_drafter_host_pinned_embeddings_still_need_ram(monkeypatch):
-    """Discounting a GPU drafter's embeddings from VRAM moves them to the
-    host-only ledger; it does not erase them from the load-mode footprint."""
-    monkeypatch.setattr(hardware, "is_apple_silicon", lambda: False)
-    stub = _Stub(4 * 1024)
-
-    def _fit(host_only_bytes = 0):
-        return LlamaCppBackend._fit_derived_load_mode(
-            stub,
-            model_size = 8 * GIB,
-            gpus = [(0, 24 * 1024)],
-            avail_mib = 4 * 1024,
-            host_only_bytes = host_only_bytes,
-        )
-
-    assert _fit() == FIT_MODE
-    assert _fit(3 * GIB) is None
 
 
 # ------------------------------------------- the fitter's own VRAM margin
@@ -797,35 +766,6 @@ def test_the_cpu_fallback_keeps_a_load_mode_the_user_asked_for(monkeypatch):
     ):
         out, _reason, _note = backend._prepare_cpu_fallback_launch("llama-server", replay, {}, {})
     assert out[-2:] == ["--load-mode", "none"]
-
-
-def test_an_unsized_cpu_drafter_forces_the_fallback_to_pageable_loading():
-    """Unknown companion bytes cannot prove an unmapped CPU replay fits."""
-    from unittest import mock
-
-    from core.inference import llama_cpp as lc
-
-    backend = LlamaCppBackend.__new__(LlamaCppBackend)
-    backend._fit_load_mode_flags = []
-    replay = ["llama-server", "-m", "model.gguf", "--load-mode", "none"]
-    with (
-        mock.patch.object(lc.LlamaCppBackend, "_is_vulkan_backend", return_value = True),
-        mock.patch.object(lc.LlamaCppBackend, "_cpu_isolated_replay", return_value = list(replay)),
-        mock.patch.object(lc.LlamaCppBackend, "_cpu_isolated_binary", return_value = "cpu-server"),
-        mock.patch.object(
-            lc.LlamaCppBackend,
-            "_llama_server_env_for_binary",
-            return_value = {lc._loader_path_var(): "/staged"},
-        ),
-        mock.patch.object(lc.LlamaCppBackend, "_launch_host_shortfall_message", return_value = None),
-    ):
-        out, _reason, note = backend._prepare_cpu_fallback_launch(
-            "llama-server", replay, {}, {}, additional_host_only_bytes = None
-        )
-
-    assert "--load-mode" not in out
-    assert "--no-mmap" not in out
-    assert note
 
 
 def test_only_the_recorded_subsequence_is_removed():

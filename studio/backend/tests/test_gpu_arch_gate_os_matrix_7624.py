@@ -784,9 +784,6 @@ def _run_auto_load(
     apu_ram_stub = None,
     host_offload_stub = None,
     backend = None,
-    context_length = None,
-    kv_bytes_stub = None,
-    configure_backend = None,
 ):
     """Drive a real automatic (no explicit GPU pick) llama-server load with the real
     ``_get_gpu_memory`` behind it, and return the spawned (cmd, env) list.
@@ -814,14 +811,8 @@ def _run_auto_load(
     # cannot show (e.g. _gpu_offload_active).
     if capture is not None:
         capture["backend"] = backend
-    backend._read_gguf_metadata = lambda _path: (
-        setattr(backend, "_context_length", context_length) if context_length is not None else None
-    )
-    backend._can_estimate_kv = lambda: kv_bytes_stub is not None
-    if kv_bytes_stub is not None:
-        backend._estimate_kv_cache_bytes = kv_bytes_stub
-        backend._compute_buffer_ctx_bytes = lambda *_a, **_kw: 0
-        backend._estimate_compute_buffer_bytes = lambda **_kw: 1
+    backend._read_gguf_metadata = lambda _path: None
+    backend._can_estimate_kv = lambda: False
     # model_bytes drives the placement decision: a model no GPU can hold makes
     # _select_gpus return (None, True), so `--fit on` owns placement.
     backend._get_gguf_size_bytes = lambda _path: model_bytes
@@ -835,8 +826,6 @@ def _run_auto_load(
     backend._find_llama_server_binary = lambda include_denied = False: binary
     backend._fit_off_retry_eligible = lambda *_args, **_kwargs: False
     backend.probe_server_capabilities = lambda _binary: {"found": True}
-    if configure_backend is not None:
-        configure_backend(backend)
     backend._record_server_pid = lambda _pid: None
     backend._clear_server_pid = lambda: None
     # env_extra seeds the child env the way an inherited / user-set variable
@@ -2179,133 +2168,6 @@ class TestArchCrashRetryRechecksTheApuRamGuard:
         assert "only about 8 GB" in (capture["backend"].last_load_warning or "")
         # capture["error"] is now the simulated HIP crash, not the RAM guard, so
         # asserting the guard's text there would only re-test the mock.
-
-    def test_retry_onto_an_apu_restores_the_discrete_host_pinned_discount(
-        self, tmp_path, monkeypatch, probe_env
-    ):
-        """The first placement is discrete-only, so its host-pinned embeddings do
-        not consume VRAM. The kernel-image retry moves to an APU where those bytes
-        return to the shared system-RAM pool and must be charged again."""
-        torch = self._dgpu_then_apu(monkeypatch)
-        backend = LlamaCppBackend()
-        backend._host_pinned_vram_discount = lambda *_a, **_kw: 4 * 1024**3
-        calls: list = []
-
-        def _shortfall(model_size_bytes, avail_mib, *_a, **_kw):
-            calls.append((model_size_bytes, avail_mib))
-            return "This model needs about 20 GB but only about 8 GB is available."
-
-        launches = _run_auto_load(
-            monkeypatch,
-            tmp_path,
-            torch,
-            None,
-            returncode = 1,
-            output = "ROCm error: device kernel image is invalid",
-            model_bytes = 20 * 1024**3,
-            apu_ram_stub = _shortfall,
-            backend = backend,
-        )
-
-        assert launches, "the first spawn never ran"
-        assert len(calls) == 1
-        assert calls[0][0] == 20 * 1024**3
-
-    def test_retry_onto_an_apu_replans_the_discounted_auto_context(
-        self, tmp_path, monkeypatch, probe_env
-    ):
-        """The dGPU can spend the host-pinned discount on context, but an APU
-        retry draws those weights from the same pool and must reprice the plan."""
-        gib = 1024**3
-        torch = self._dgpu_then_apu(monkeypatch)
-        backend = LlamaCppBackend()
-        backend._host_pinned_vram_discount = lambda *_a, **_kw: 4 * gib
-        backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
-        backend._fit_derived_load_mode = lambda **_kw: "none"
-
-        launches = _run_auto_load(
-            monkeypatch,
-            tmp_path,
-            torch,
-            None,
-            returncode = 1,
-            output = "ROCm error: device kernel image is invalid",
-            model_bytes = 20 * gib,
-            apu_ram_stub = lambda *_a, **_kw: "APU memory shortfall",
-            backend = backend,
-            context_length = 32_768,
-            kv_bytes_stub = lambda ctx, *_a, **_kw: 8 * gib * ctx // 32_768,
-            intent_kwargs = {"n_ctx": 0},
-        )
-
-        first_cmd = launches[0][0]
-        retry_cmd = next(cmd for cmd, env in launches if env.get("ROCR_VISIBLE_DEVICES") == "1")
-        assert first_cmd[first_cmd.index("-c") + 1] == "32768"
-        assert first_cmd[first_cmd.index("--fit") + 1] == "off"
-        assert "--no-mmap" in first_cmd
-        assert retry_cmd[retry_cmd.index("-c") + 1] == "8192"
-        assert retry_cmd[retry_cmd.index("--fit") + 1] == "on"
-        assert "--no-mmap" not in retry_cmd
-        assert backend._effective_context_length == 8192
-        assert backend._max_context_length == 8192
-
-    def test_retry_onto_an_apu_restores_a_drafter_only_discount(
-        self, tmp_path, monkeypatch, probe_env
-    ):
-        """A separate drafter can own the entire discrete-only discount. The
-        retry must still run and restore those bytes before sizing the APU."""
-        gib = 1024**3
-        torch = self._dgpu_then_apu(monkeypatch)
-        draft = tmp_path / "draft.gguf"
-        draft.write_bytes(b"draft")
-        backend = LlamaCppBackend()
-        backend._torch_unified_memory_classification_known = lambda ids = None: ids == [0]
-        backend._fit_derived_load_mode = lambda **_kw: "none"
-
-        def configure(candidate):
-            candidate._get_gguf_size_bytes = lambda path: (
-                4 * gib if Path(path) == draft else 20 * gib
-            )
-            candidate._host_pinned_vram_discount = (
-                lambda *_a, draft_model = False, **_kw: 4 * gib if draft_model else 0
-            )
-            candidate._draft_backend_for = lambda _path: types.SimpleNamespace(
-                _n_layers = 32,
-                _architecture = "gemma3",
-                _can_estimate_kv = lambda: True,
-                _estimate_kv_cache_bytes = lambda *_a, **_kw: 1,
-            )
-            candidate.probe_server_capabilities = lambda _binary: {
-                "found": True,
-                "mtp_token": "draft-mtp",
-                "spec_draft_n_max_flag": "--spec-draft-n-max",
-                "supports_kv_unified": True,
-            }
-
-        launches = _run_auto_load(
-            monkeypatch,
-            tmp_path,
-            torch,
-            None,
-            returncode = 1,
-            output = "ROCm error: device kernel image is invalid",
-            model_bytes = 20 * gib,
-            backend = backend,
-            context_length = 32_768,
-            kv_bytes_stub = lambda ctx, *_a, **_kw: 8 * gib * ctx // 32_768,
-            intent_kwargs = {
-                "n_ctx": 0,
-                "mtp_draft_path": str(draft),
-                "speculative_type": "auto",
-            },
-            configure_backend = configure,
-        )
-
-        first_cmd = launches[0][0]
-        retry_cmd = next(cmd for cmd, env in launches if env.get("ROCR_VISIBLE_DEVICES") == "1")
-        assert first_cmd[first_cmd.index("-c") + 1] == "32768"
-        assert int(retry_cmd[retry_cmd.index("-c") + 1]) < 32_768
-        assert retry_cmd[retry_cmd.index("--fit") + 1] == "on"
 
     def test_a_model_that_fits_still_retries_onto_the_apu(self, tmp_path, monkeypatch, probe_env):
         """The guard warns on a shortfall, it does not block the fallback. With

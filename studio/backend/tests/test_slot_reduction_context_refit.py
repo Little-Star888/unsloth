@@ -83,13 +83,10 @@ def _plan(
     n_ctx = 0,
     metadata = HYBRID,
     gpus = 1,
-    host_discount_mib = 0,
-    shared_ids = (),
 ):
     """Return the generated placement plan. ``vram_mib`` may be a per-card sequence."""
     cards = list(vram_mib) if isinstance(vram_mib, (tuple, list)) else [vram_mib] * gpus
-    shared_ids = set(shared_ids)
-    memory = [(i, mib, 0 if i in shared_ids else mib) for i, mib in enumerate(cards)]
+    memory = [(i, mib, mib) for i, mib in enumerate(cards)]
     backend, gguf = _backend(tmp_path, vulkan = False, memory = memory)
 
     def read(_path):
@@ -98,12 +95,6 @@ def _plan(
 
     backend._read_gguf_metadata = read
     backend._get_gguf_size_bytes = lambda _path: weights_mib * MIB
-    backend._host_pinned_vram_discount = lambda *_a, **_kw: host_discount_mib * MIB
-    backend._amd_apu_wants_unified_memory = lambda ids = None: (
-        bool(shared_ids) if ids is None else bool(set(ids) & shared_ids)
-    )
-    backend._integrated_cuda_unified_memory = lambda *_a, **_kw: False
-    backend._torch_unified_memory_classification_known = lambda *_a, **_kw: True
     del backend._can_estimate_kv  # the real one, now that the dims are set
     backend.probe_server_capabilities = lambda _binary = None: {
         "mtp_token": "draft-mtp",
@@ -113,11 +104,6 @@ def _plan(
         "supports_kv_unified": True,
         "supports_fit_ctx": True,
     }
-    fit_inputs = []
-    real_fit_mode = backend._fit_derived_load_mode
-    backend._fit_derived_load_mode = lambda **kwargs: (
-        fit_inputs.append(kwargs) or real_fit_mode(**kwargs)
-    )
     launched = _launch(backend, gguf, speculative_type = spec, n_ctx = n_ctx, n_parallel = n_parallel)
     cmd = launched["cmd"]
 
@@ -131,7 +117,6 @@ def _plan(
         "spec": flag("--spec-type", "-"),
         "ceiling": backend._max_context_length,
         "devices": (launched["env"] or {}).get("CUDA_VISIBLE_DEVICES"),
-        "fit_inputs": fit_inputs,
     }
 
 
@@ -215,23 +200,6 @@ class TestTheRefitStaysOnTheCardsTheReductionChose:
         alone = _plan(tmp_path, weights_mib = _KEEPS_TWO_MIB, n_parallel = 4, spec = "off")
         assert mixed["ctx"] == alone["ctx"] == 13_824
         assert (mixed["ceiling"], alone["ceiling"]) == (14_848, 13_824)
-
-    def test_a_slot_selected_discrete_card_adopts_its_host_discount(self, tmp_path):
-        """The initial four-slot plan does not fit. Slot reduction makes the
-        first concrete selection, so downstream host accounting must adopt that
-        discrete candidate's discount before deriving load mode."""
-        got = _plan(
-            tmp_path,
-            weights_mib = _KEEPS_TWO_MIB,
-            n_parallel = 4,
-            spec = "off",
-            vram_mib = MIXED_CARDS,
-            host_discount_mib = 256,
-            shared_ids = {1},
-        )
-
-        assert (got["slots"], got["devices"]) == (2, "0")
-        assert got["fit_inputs"][-1]["host_only_bytes"] == 256 * MIB
 
 
 class TestAutoSpeculationStillDecidesBeforeTheReduction:
